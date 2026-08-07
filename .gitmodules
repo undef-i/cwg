@@ -1,0 +1,9 @@
+[submodule "ext/libsodium"]
+	path = ext/libsodium
+	url = https://github.com/jedisct1/libsodium.git
+[submodule "ext/uthash"]
+	path = ext/uthash
+	url = https://github.com/troydhanson/uthash.git
+[submodule "ext/blake2"]
+	path = ext/blake2
+	url = https://github.com/BLAKE2/BLAKE2.git

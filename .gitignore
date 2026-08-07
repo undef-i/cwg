@@ -1,0 +1,12 @@
+*.o
+*.d
+build/
+dev.sh
+dev/
+ref/
+test/
+.vscode/
+.idea/
+.*.swp
+*~
+.DS_Store
