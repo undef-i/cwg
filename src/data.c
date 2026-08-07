@@ -415,6 +415,7 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
   int af;
   Peer *p;
   WorkJob j;
+  WorkJob *job;
   if (len >= 20 && (buf[0] >> 4) == 4)
     af = AF_INET, dst = buf + 16;
   else if (len >= 40 && (buf[0] >> 4) == 6)
@@ -428,13 +429,18 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
       pthread_rwlock_unlock (&d->lock);
       return;
     }
-  if (out_job (d, p, buf, len, &j))
+  job = work_reserve ();
+  if (job && out_job (d, p, buf, len, job))
     {
-      if (!work_submit (&j) && !work_count ())
-        {
-          data_work (&j);
-          data_commit (&j);
-        }
+      work_submit (job);
+      pthread_rwlock_unlock (&d->lock);
+      return;
+    }
+  work_release (job);
+  if (!work_count () && out_job (d, p, buf, len, &j))
+    {
+      data_work (&j);
+      data_commit (&j);
       pthread_rwlock_unlock (&d->lock);
       return;
     }
@@ -700,6 +706,7 @@ data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
   if (le32toh (type) == MSG_DATA)
     {
       WorkJob j;
+      WorkJob *job;
       const MsgData *m = (const void *)buf;
       Idx *e;
       Kp *k;
@@ -712,34 +719,42 @@ data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
           pthread_rwlock_unlock (&d->lock);
           return;
         }
-      memset (&j, 0, offsetof (WorkJob, buf));
-      j.dev = d;
-      j.type = WORK_IN;
-      j.ep = *src;
-      j.cnt = le64toh (m->cnt);
-      j.index = le32toh (m->recv);
-      j.wire_len = len;
+      job = work_reserve ();
+      if (!job && work_count ())
+        return;
+      if (!job)
+        job = &j;
+      memset (job, 0, offsetof (WorkJob, buf));
+      job->dev = d;
+      job->type = WORK_IN;
+      job->ep = *src;
+      job->cnt = le64toh (m->cnt);
+      job->index = le32toh (m->recv);
+      job->wire_len = len;
       pthread_rwlock_rdlock (&d->lock);
       pthread_mutex_lock (&d->data_lock);
-      e = idx_fnd (d->idx, j.index);
+      e = idx_fnd (d->idx, job->index);
       if (!e || e->type != IDX_KP || !(k = e->ptr) || !k->ok
-          || data_now () - k->born >= REJECT_MS || j.cnt >= REPLAY_LIMIT)
+          || data_now () - k->born >= REJECT_MS || job->cnt >= REPLAY_LIMIT)
         {
           pthread_mutex_unlock (&d->data_lock);
           pthread_rwlock_unlock (&d->lock);
+          work_release (job == &j ? NULL : job);
           return;
         }
-      j.receiver = k->li;
-      memcpy (j.key, k->rx, sizeof (j.key));
-      memcpy (j.peer, k->peer->pk, sizeof (j.peer));
-      memcpy (j.buf, buf, len);
-      j.len = len;
+      job->receiver = k->li;
+      memcpy (job->key, k->rx, sizeof (job->key));
+      memcpy (job->peer, k->peer->pk, sizeof (job->peer));
+      memcpy (job->buf, buf, len);
+      job->len = len;
       pthread_mutex_unlock (&d->data_lock);
-      if (!work_submit (&j) && !work_count ())
+      if (job == &j)
         {
           data_work (&j);
           data_commit (&j);
         }
+      else
+        work_submit (job);
       pthread_rwlock_unlock (&d->lock);
       return;
     }

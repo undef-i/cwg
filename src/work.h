@@ -29,7 +29,9 @@ typedef struct
 } WorkJob;
 
 int work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *));
-bool work_submit (const WorkJob *job);
+WorkJob *work_reserve (void);
+void work_release (WorkJob *job);
+void work_submit (WorkJob *job);
 void work_drain (void);
 void work_stop (void);
 unsigned work_count (void);

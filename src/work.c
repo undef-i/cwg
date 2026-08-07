@@ -147,27 +147,52 @@ fail:
   return -1;
 }
 
-bool
-work_submit (const WorkJob *job)
+WorkJob *
+work_reserve (void)
 {
-  unsigned idx, tail;
+  unsigned idx;
   WorkJob *j;
-  if (!g.nthread || !job || job->type > WORK_IN
-      || job->len > sizeof (g.slot[0].buf))
-    return false;
+  if (!g.nthread)
+    return NULL;
   pthread_mutex_lock (&g.lock);
   while (!g.free_n && !g.stopping)
     pthread_cond_wait (&g.space, &g.lock);
   if (g.stopping)
     {
       pthread_mutex_unlock (&g.lock);
-      return false;
+      return NULL;
     }
   idx = g.freeq[g.free_head];
   g.free_head = (g.free_head + 1U) % SLOT_N;
   g.free_n--;
   j = &g.slot[idx];
-  *j = *job;
+  pthread_mutex_unlock (&g.lock);
+  return j;
+}
+
+void
+work_release (WorkJob *j)
+{
+  unsigned idx, tail;
+  if (!j)
+    return;
+  idx = (unsigned)(j - g.slot);
+  pthread_mutex_lock (&g.lock);
+  tail = (g.free_head + g.free_n) % SLOT_N;
+  g.freeq[tail] = idx;
+  g.free_n++;
+  pthread_cond_signal (&g.space);
+  pthread_mutex_unlock (&g.lock);
+}
+
+void
+work_submit (WorkJob *j)
+{
+  unsigned idx, tail;
+  if (!j || j->type > WORK_IN || j->len > sizeof (j->buf))
+    return;
+  idx = (unsigned)(j - g.slot);
+  pthread_mutex_lock (&g.lock);
   j->seq = j->dev->work_submit[j->type]++;
   tail = (g.ready_head + g.ready_n) % SLOT_N;
   g.readyq[tail] = idx;
@@ -175,7 +200,6 @@ work_submit (const WorkJob *job)
   g.active++;
   pthread_cond_signal (&g.ready);
   pthread_mutex_unlock (&g.lock);
-  return true;
 }
 
 void
