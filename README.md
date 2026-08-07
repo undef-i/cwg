@@ -25,8 +25,15 @@ $ cwg wg0
 ```
 
 This creates an interface and forks into the background. To remove the
-interface, use the usual `ip link del wg0`. To run `cwg` without forking to the
-background, pass `-f` or `--foreground`:
+interface, use the usual `ip link del wg0`, or, if the system does not support
+removing interfaces directly, remove its control socket:
+
+```sh
+$ rm -f /var/run/wireguard/wg0.sock
+```
+
+This causes `cwg` to shut down the interface. To run `cwg` without forking to
+the background, pass `-f` or `--foreground`:
 
 ```sh
 $ cwg -f wg0

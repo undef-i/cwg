@@ -8,7 +8,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop;
@@ -25,6 +27,7 @@ enum
   FD_TUN,
   FD_UAPI,
   FD_UDP,
+  FD_INOTIFY,
 };
 
 static Dev *
@@ -85,17 +88,21 @@ loop_run (Dev *head, int ctl)
   uint8_t *buf = malloc (PKT_MAX);
   UdpPacket *pkt = calloc (UDP_BATCH_MAX, sizeof (*pkt));
   int ep = epoll_create1 (EPOLL_CLOEXEC);
-  if (ep < 0 || !buf || !pkt)
+  int ino = inotify_init1 (IN_CLOEXEC | IN_NONBLOCK);
+  if (ep < 0 || ino < 0 || !buf || !pkt)
     {
       free (pkt);
       free (buf);
       if (ep >= 0)
         close (ep);
+      if (ino >= 0)
+        close (ino);
       return -1;
     }
   if (work_start (data_work, data_commit) < 0)
     {
       close (ep);
+      close (ino);
       free (pkt);
       free (buf);
       return -1;
@@ -104,6 +111,11 @@ loop_run (Dev *head, int ctl)
   ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
   ev.data.fd = ctl;
   if (epoll_ctl (ep, EPOLL_CTL_ADD, ctl, &ev) < 0)
+    goto fail;
+  if (inotify_add_watch (ino, SOCKET_DIR, IN_DELETE) < 0)
+    goto fail;
+  ev.data.fd = ino;
+  if (epoll_ctl (ep, EPOLL_CTL_ADD, ino, &ev) < 0)
     goto fail;
   for (Dev *d = head; d; d = d->next)
     {
@@ -137,6 +149,29 @@ loop_run (Dev *head, int ctl)
           if (arr[i].data.fd == ctl)
             {
               if (ctl_hnd (ctl, &head, ep) < 0)
+                goto fail;
+              continue;
+            }
+          if (arr[i].data.fd == ino)
+            {
+              char ibuf[sizeof (struct inotify_event) + 256];
+              ssize_t nr;
+              while ((nr = read (ino, ibuf, sizeof (ibuf))) > 0)
+                for (size_t off = 0; off < (size_t)nr;)
+                  {
+                    struct inotify_event *ie
+                        = (struct inotify_event *)(ibuf + off);
+                    Dev *d;
+                    for (d = head; d; d = d->next)
+                      if ((ie->mask & IN_DELETE) && ie->len
+                          && !strcmp (ie->name, d->sock + strlen (SOCKET_DIR) + 1))
+                        {
+                          dev_del (&head, d, ep);
+                          break;
+                        }
+                    off += sizeof (*ie) + ie->len;
+                  }
+              if (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
                 goto fail;
               continue;
             }
@@ -212,6 +247,7 @@ loop_run (Dev *head, int ctl)
     }
   dev_all_del (&head, ep);
   work_stop ();
+  close (ino);
   close (ep);
   free (pkt);
   free (buf);
@@ -220,6 +256,7 @@ loop_run (Dev *head, int ctl)
 fail:
   dev_all_del (&head, ep);
   work_stop ();
+  close (ino);
   close (ep);
   free (pkt);
   free (buf);
