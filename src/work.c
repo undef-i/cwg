@@ -18,6 +18,7 @@ enum
   SLOT_RESERVED,
   SLOT_READY,
   SLOT_DONE,
+  SLOT_FREE,
 };
 
 typedef struct
@@ -162,7 +163,13 @@ work_reserve (unsigned type)
     return NULL;
   pthread_mutex_lock (&g.lock);
   while (!g.free_n[type] && !g.stopping)
-    pthread_cond_wait (&g.space, &g.lock);
+    {
+      pthread_mutex_unlock (&g.lock);
+      work_hnd ();
+      pthread_mutex_lock (&g.lock);
+      if (!g.free_n[type] && !g.stopping)
+        pthread_cond_wait (&g.space, &g.lock);
+    }
   if (g.stopping)
     {
       pthread_mutex_unlock (&g.lock);
@@ -185,6 +192,7 @@ work_release (WorkJob *j, unsigned type)
     return;
   idx = (unsigned)(j - g.slot);
   pthread_mutex_lock (&g.lock);
+  atomic_store_explicit (&j->state, SLOT_FREE, memory_order_release);
   tail = (g.free_head[type] + g.free_n[type]) % SLOT_PER_TYPE;
   g.freeq[type][tail] = idx;
   g.free_n[type]++;
@@ -244,6 +252,8 @@ work_hnd (void)
       pthread_mutex_unlock (&g.lock);
 
       j = &g.slot[idx];
+      if (atomic_load_explicit (&j->state, memory_order_acquire) != SLOT_DONE)
+        continue;
       Peer *p = j->owner;
       unsigned type = j->type;
       while ((j = p->work_head[type])
