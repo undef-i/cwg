@@ -1,18 +1,18 @@
 # cwg
 
-This is a userspace implementation of WireGuard.
+A userspace implementation of WireGuard
 
 ## Building
 
 ```sh
-$ git submodule update --init
-$ make
+git submodule update --init
+make
 ```
 
 ## Installation
 
 ```sh
-$ sudo install -m 0755 build/cwg /usr/local/bin/cwg
+sudo install -m 0755 build/cwg /usr/local/bin/cwg
 ```
 
 ## Usage
