@@ -28,6 +28,7 @@ enum
   FD_UAPI,
   FD_UDP,
   FD_INOTIFY,
+  FD_WORK,
 };
 
 static Dev *
@@ -117,6 +118,9 @@ loop_run (Dev *head, int ctl)
   ev.data.fd = ino;
   if (epoll_ctl (ep, EPOLL_CTL_ADD, ino, &ev) < 0)
     goto fail;
+  ev.data.fd = work_fd ();
+  if (epoll_ctl (ep, EPOLL_CTL_ADD, work_fd (), &ev) < 0)
+    goto fail;
   for (Dev *d = head; d; d = d->next)
     {
       ev.data.fd = d->tun;
@@ -173,6 +177,11 @@ loop_run (Dev *head, int ctl)
                   }
               if (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
                 goto fail;
+              continue;
+            }
+          if (arr[i].data.fd == work_fd ())
+            {
+              work_hnd ();
               continue;
             }
           Dev *d = dev_fd (head, arr[i].data.fd, &kind);
@@ -243,6 +252,7 @@ loop_run (Dev *head, int ctl)
           pthread_rwlock_wrlock (&d->lock);
           data_tick (d, now);
           pthread_rwlock_unlock (&d->lock);
+          dev_reap (d);
         }
     }
   dev_all_del (&head, ep);

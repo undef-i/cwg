@@ -1,4 +1,5 @@
 #include "device.h"
+#include "work.h"
 
 #include <errno.h>
 #include <sodium.h>
@@ -13,6 +14,13 @@ mono (void)
   struct timespec ts;
   clock_gettime (CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec;
+}
+
+static void
+peer_destroy (Peer *p)
+{
+  sodium_memzero (p, sizeof (*p));
+  free (p);
 }
 
 static void
@@ -74,11 +82,7 @@ dev_new (const char *name)
   d->udp4 = -1;
   d->udp6 = -1;
   if (pthread_rwlock_init (&d->lock, NULL)
-      || pthread_mutex_init (&d->data_lock, NULL)
-      || pthread_mutex_init (&d->work_lock[0], NULL)
-      || pthread_mutex_init (&d->work_lock[1], NULL)
-      || pthread_cond_init (&d->work_ready[0], NULL)
-      || pthread_cond_init (&d->work_ready[1], NULL))
+      || pthread_mutex_init (&d->data_lock, NULL))
     {
       free (d);
       return NULL;
@@ -96,8 +100,26 @@ dev_peer_del (Dev *d, Peer *p)
   aip_del_peer (d, p);
   HASH_DEL (d->peer, p);
   dev_peer_reset (d, p);
-  sodium_memzero (p, sizeof (*p));
-  free (p);
+  p->retired = true;
+  p->retired_next = d->retired;
+  d->retired = p;
+}
+
+void
+dev_reap (Dev *d)
+{
+  Peer **pp = &d->retired;
+  while (*pp)
+    {
+      Peer *p = *pp;
+      if (atomic_load_explicit (&p->work_ref, memory_order_acquire))
+        {
+          pp = &p->retired_next;
+          continue;
+        }
+      *pp = p->retired_next;
+      peer_destroy (p);
+    }
 }
 
 void
@@ -112,13 +134,11 @@ dev_free (Dev *d)
 {
   if (!d)
     return;
+  work_drain ();
   dev_peer_clr (d);
+  dev_reap (d);
   idx_clr (&d->idx);
   udp_close (d->udp4, d->udp6);
-  pthread_cond_destroy (&d->work_ready[1]);
-  pthread_cond_destroy (&d->work_ready[0]);
-  pthread_mutex_destroy (&d->work_lock[1]);
-  pthread_mutex_destroy (&d->work_lock[0]);
   pthread_mutex_destroy (&d->data_lock);
   pthread_rwlock_destroy (&d->lock);
   sodium_memzero (d, sizeof (*d));

@@ -24,24 +24,20 @@ link add wg0 type wireguard`. With `cwg`, instead simply run:
 $ cwg wg0
 ```
 
-This creates an interface and forks into the background. To remove the
-interface, use the usual `ip link del wg0`, or, if the system does not support
-removing interfaces directly, remove its control socket:
+This will create an interface and fork into the background. To remove the
+interface, use the usual `ip link del wg0`, or, if your system does not support
+removing interfaces directly, you may instead remove the control socket via
+`rm -f /var/run/wireguard/wg0.sock`, which will result in `cwg` shutting down.
 
-```sh
-$ rm -f /var/run/wireguard/wg0.sock
-```
-
-This causes `cwg` to shut down the interface. To run `cwg` without forking to
-the background, pass `-f` or `--foreground`:
+To run `cwg` without forking to the background, pass `-f` or `--foreground`:
 
 ```sh
 $ cwg -f wg0
 ```
 
 When an interface is running, use `wg(8)` to configure it, along with the
-usual `ip(8)` and `ifconfig(8)` commands. To enable debug logging, set
-`LOG_LEVEL=debug`.
+usual `ip(8)` and `ifconfig(8)` commands. For debug logging, set
+`LOG_LEVEL=debug`, preferably together with `-f` or `--foreground`.
 
 ## License
 

@@ -416,6 +416,7 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
   Peer *p;
   WorkJob j;
   WorkJob *job;
+  bool reserved;
   if (len >= 20 && (buf[0] >> 4) == 4)
     af = AF_INET, dst = buf + 16;
   else if (len >= 40 && (buf[0] >> 4) == 6)
@@ -429,14 +430,22 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
       pthread_rwlock_unlock (&d->lock);
       return;
     }
-  job = work_reserve ();
+  job = work_reserve (WORK_OUT);
+  reserved = job != NULL;
   if (job && out_job (d, p, buf, len, job))
     {
+      job->owner = p;
+      atomic_fetch_add_explicit (&p->work_ref, 1, memory_order_relaxed);
       work_submit (job);
       pthread_rwlock_unlock (&d->lock);
       return;
     }
-  work_release (job);
+  work_release (job, WORK_OUT);
+  if (!reserved && work_count ())
+    {
+      pthread_rwlock_unlock (&d->lock);
+      return;
+    }
   if (!work_count () && out_job (d, p, buf, len, &j))
     {
       data_work (&j);
@@ -719,7 +728,7 @@ data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
           pthread_rwlock_unlock (&d->lock);
           return;
         }
-      job = work_reserve ();
+      job = work_reserve (WORK_IN);
       if (!job && work_count ())
         return;
       if (!job)
@@ -739,10 +748,14 @@ data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
         {
           pthread_mutex_unlock (&d->data_lock);
           pthread_rwlock_unlock (&d->lock);
-          work_release (job == &j ? NULL : job);
+          work_release (job == &j ? NULL : job, WORK_IN);
           return;
         }
       job->receiver = k->li;
+      job->owner = k->peer;
+      if (job != &j)
+        atomic_fetch_add_explicit (&job->owner->work_ref, 1,
+                                   memory_order_relaxed);
       memcpy (job->key, k->rx, sizeof (job->key));
       memcpy (job->peer, k->peer->pk, sizeof (job->peer));
       memcpy (job->buf, buf, len);

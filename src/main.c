@@ -33,7 +33,7 @@ daemonize (void)
     return 1;
   if (setsid () < 0)
     return -1;
-  if (!getenv ("LOG_LEVEL"))
+  if (g_log != LOG_DBG)
     {
       int fd = open ("/dev/null", O_RDWR);
       if (fd >= 0)

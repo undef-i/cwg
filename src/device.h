@@ -17,6 +17,7 @@ typedef struct Peer Peer;
 typedef struct Dev Dev;
 typedef struct Kp Kp;
 typedef struct Pkt Pkt;
+typedef struct WorkJob WorkJob;
 
 #define STAGE_MAX 128U
 
@@ -70,6 +71,13 @@ struct Peer
   bool mac1_ok;
   Pkt *q[STAGE_MAX];
   size_t qn;
+  atomic_uint work_ref;
+  bool retired;
+  Peer *retired_next;
+  WorkJob *work_head[2];
+  WorkJob *work_tail[2];
+  uint64_t work_submit[2];
+  uint64_t work_commit[2];
   UT_hash_handle hh;
 };
 
@@ -95,14 +103,11 @@ struct Dev
   uint16_t port;
   uint32_t mark;
   Peer *peer;
+  Peer *retired;
   Aip *aip;
   Idx *idx;
   pthread_rwlock_t lock;
   pthread_mutex_t data_lock;
-  pthread_mutex_t work_lock[2];
-  pthread_cond_t work_ready[2];
-  uint64_t work_submit[2];
-  uint64_t work_commit[2];
   Dev *next;
 };
 
@@ -112,6 +117,7 @@ void dev_peer_clr (Dev *d);
 Peer *dev_peer_fnd (Dev *d, const uint8_t pk[KEY_LEN]);
 Peer *dev_peer_get (Dev *d, const uint8_t pk[KEY_LEN], bool *is_new);
 void dev_peer_del (Dev *d, Peer *p);
+void dev_reap (Dev *d);
 void dev_key_set (Dev *d, const uint8_t sk[KEY_LEN]);
 void dev_peer_reset (Dev *d, Peer *p);
 int dev_bind (Dev *d, uint16_t port, uint32_t mark);

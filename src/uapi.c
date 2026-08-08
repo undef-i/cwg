@@ -1,6 +1,7 @@
 #include "uapi.h"
 #include "data.h"
 #include "utils.h"
+#include "work.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -351,6 +352,7 @@ uapi_hnd (Dev *d)
       struct timeval tv = { .tv_sec = 1 };
       setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
       setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+      work_drain ();
       pthread_rwlock_wrlock (&d->lock);
       conn_hnd (d, fd);
       pthread_rwlock_unlock (&d->lock);

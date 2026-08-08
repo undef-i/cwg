@@ -3,7 +3,11 @@
 #include "common.h"
 #include "udp.h"
 
+#include <stdatomic.h>
+
 typedef struct Dev Dev;
+typedef struct Peer Peer;
+typedef struct WorkJob WorkJob;
 
 enum
 {
@@ -11,9 +15,10 @@ enum
   WORK_IN,
 };
 
-typedef struct
+struct WorkJob
 {
   Dev *dev;
+  Peer *owner;
   Ep ep;
   uint8_t peer[KEY_LEN];
   uint8_t key[KEY_LEN];
@@ -25,12 +30,16 @@ typedef struct
   size_t wire_len;
   unsigned type;
   bool ok;
+  atomic_uint state;
+  struct WorkJob *next;
   uint8_t buf[2048];
-} WorkJob;
+};
 
 int work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *));
-WorkJob *work_reserve (void);
-void work_release (WorkJob *job);
+int work_fd (void);
+int work_hnd (void);
+WorkJob *work_reserve (unsigned type);
+void work_release (WorkJob *job, unsigned type);
 void work_submit (WorkJob *job);
 void work_drain (void);
 void work_stop (void);

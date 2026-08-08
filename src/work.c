@@ -6,12 +6,18 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <poll.h>
 #include <unistd.h>
 
 enum
 {
-  SLOT_N = 256,
+  SLOT_N = 1024,
+  SLOT_PER_TYPE = SLOT_N / 2,
   BATCH_N = 16,
+  SLOT_RESERVED,
+  SLOT_READY,
+  SLOT_DONE,
 };
 
 typedef struct
@@ -21,11 +27,14 @@ typedef struct
   pthread_cond_t drained;
   pthread_cond_t space;
   pthread_t *thread;
+  int event;
   WorkJob slot[SLOT_N];
-  unsigned freeq[SLOT_N];
+  unsigned freeq[2][SLOT_PER_TYPE];
   unsigned readyq[SLOT_N];
-  unsigned free_head, free_n;
+  unsigned doneq[SLOT_N];
+  unsigned free_head[2], free_n[2];
   unsigned ready_head, ready_n;
+  unsigned done_head, done_n;
   unsigned active;
   unsigned nthread;
   bool stopping;
@@ -52,7 +61,7 @@ workers_get (void)
     }
   if (n < 1)
     n = 1;
-  return (unsigned)(n < 4 ? n : 4);
+  return (unsigned)n;
 }
 
 static void *
@@ -80,32 +89,21 @@ worker (void *arg)
       pthread_mutex_unlock (&g.lock);
 
       for (unsigned i = 0; i < n; i++)
-        {
-          WorkJob *j = &g.slot[idx[i]];
-          Dev *d = j->dev;
-          unsigned type = j->type;
-          g.run (j);
-          pthread_mutex_lock (&d->work_lock[type]);
-          while (j->seq != d->work_commit[type])
-            pthread_cond_wait (&d->work_ready[type], &d->work_lock[type]);
-          g.commit (j);
-          d->work_commit[type]++;
-          pthread_cond_broadcast (&d->work_ready[type]);
-          pthread_mutex_unlock (&d->work_lock[type]);
-        }
+        g.run (&g.slot[idx[i]]);
 
       pthread_mutex_lock (&g.lock);
       for (unsigned i = 0; i < n; i++)
         {
-          unsigned tail = (g.free_head + g.free_n) % SLOT_N;
-          g.freeq[tail] = idx[i];
-          g.free_n++;
+          unsigned tail = (g.done_head + g.done_n) % SLOT_N;
+          atomic_store_explicit (&g.slot[idx[i]].state, SLOT_DONE,
+                                 memory_order_release);
+          g.doneq[tail] = idx[i];
+          g.done_n++;
         }
-      g.active -= n;
-      if (!g.active)
-        pthread_cond_broadcast (&g.drained);
-      pthread_cond_broadcast (&g.space);
+      pthread_cond_broadcast (&g.drained);
       pthread_mutex_unlock (&g.lock);
+      uint64_t one = 1;
+      write (g.event, &one, sizeof (one));
     }
 }
 
@@ -114,16 +112,24 @@ work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *))
 {
   unsigned made = 0;
   memset (&g, 0, sizeof (g));
+  g.event = -1;
   if (pthread_mutex_init (&g.lock, NULL) || pthread_cond_init (&g.ready, NULL)
       || pthread_cond_init (&g.drained, NULL)
       || pthread_cond_init (&g.space, NULL))
     return -1;
   g.run = run;
   g.commit = commit;
+  g.event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (g.event < 0)
+    return -1;
   g.nthread = workers_get ();
-  g.free_n = SLOT_N;
-  for (unsigned i = 0; i < SLOT_N; i++)
-    g.freeq[i] = i;
+  g.free_n[WORK_OUT] = SLOT_PER_TYPE;
+  g.free_n[WORK_IN] = SLOT_PER_TYPE;
+  for (unsigned i = 0; i < SLOT_PER_TYPE; i++)
+    {
+      g.freeq[WORK_OUT][i] = i;
+      g.freeq[WORK_IN][i] = SLOT_PER_TYPE + i;
+    }
   if (!g.nthread)
     return 0;
   g.thread = calloc (g.nthread, sizeof (*g.thread));
@@ -148,39 +154,40 @@ fail:
 }
 
 WorkJob *
-work_reserve (void)
+work_reserve (unsigned type)
 {
   unsigned idx;
   WorkJob *j;
-  if (!g.nthread)
+  if (!g.nthread || type > WORK_IN)
     return NULL;
   pthread_mutex_lock (&g.lock);
-  while (!g.free_n && !g.stopping)
+  while (!g.free_n[type] && !g.stopping)
     pthread_cond_wait (&g.space, &g.lock);
   if (g.stopping)
     {
       pthread_mutex_unlock (&g.lock);
       return NULL;
     }
-  idx = g.freeq[g.free_head];
-  g.free_head = (g.free_head + 1U) % SLOT_N;
-  g.free_n--;
+  idx = g.freeq[type][g.free_head[type]];
+  g.free_head[type] = (g.free_head[type] + 1U) % SLOT_PER_TYPE;
+  g.free_n[type]--;
   j = &g.slot[idx];
+  atomic_store_explicit (&j->state, SLOT_RESERVED, memory_order_relaxed);
   pthread_mutex_unlock (&g.lock);
   return j;
 }
 
 void
-work_release (WorkJob *j)
+work_release (WorkJob *j, unsigned type)
 {
   unsigned idx, tail;
-  if (!j)
+  if (!j || type > WORK_IN)
     return;
   idx = (unsigned)(j - g.slot);
   pthread_mutex_lock (&g.lock);
-  tail = (g.free_head + g.free_n) % SLOT_N;
-  g.freeq[tail] = idx;
-  g.free_n++;
+  tail = (g.free_head[type] + g.free_n[type]) % SLOT_PER_TYPE;
+  g.freeq[type][tail] = idx;
+  g.free_n[type]++;
   pthread_cond_signal (&g.space);
   pthread_mutex_unlock (&g.lock);
 }
@@ -193,7 +200,14 @@ work_submit (WorkJob *j)
     return;
   idx = (unsigned)(j - g.slot);
   pthread_mutex_lock (&g.lock);
-  j->seq = j->dev->work_submit[j->type]++;
+  j->seq = j->owner->work_submit[j->type]++;
+  j->next = NULL;
+  if (j->owner->work_tail[j->type])
+    j->owner->work_tail[j->type]->next = j;
+  else
+    j->owner->work_head[j->type] = j;
+  j->owner->work_tail[j->type] = j;
+  atomic_store_explicit (&j->state, SLOT_READY, memory_order_release);
   tail = (g.ready_head + g.ready_n) % SLOT_N;
   g.readyq[tail] = idx;
   g.ready_n++;
@@ -202,14 +216,78 @@ work_submit (WorkJob *j)
   pthread_mutex_unlock (&g.lock);
 }
 
+int
+work_fd (void)
+{
+  return g.event;
+}
+
+int
+work_hnd (void)
+{
+  uint64_t value;
+  while (read (g.event, &value, sizeof (value)) > 0)
+    ;
+  for (;;)
+    {
+      unsigned idx;
+      WorkJob *j;
+      pthread_mutex_lock (&g.lock);
+      if (!g.done_n)
+        {
+          pthread_mutex_unlock (&g.lock);
+          break;
+        }
+      idx = g.doneq[g.done_head];
+      g.done_head = (g.done_head + 1U) % SLOT_N;
+      g.done_n--;
+      pthread_mutex_unlock (&g.lock);
+
+      j = &g.slot[idx];
+      Peer *p = j->owner;
+      unsigned type = j->type;
+      while ((j = p->work_head[type])
+             && atomic_load_explicit (&j->state, memory_order_acquire)
+                    == SLOT_DONE)
+        {
+          p->work_head[type] = j->next;
+          if (!p->work_head[type])
+            p->work_tail[type] = NULL;
+          g.commit (j);
+          p->work_commit[type]++;
+          atomic_fetch_sub_explicit (&p->work_ref, 1, memory_order_release);
+          work_release (j, type);
+          pthread_mutex_lock (&g.lock);
+          g.active--;
+          if (!g.active)
+            pthread_cond_broadcast (&g.drained);
+          pthread_mutex_unlock (&g.lock);
+        }
+    }
+  return 0;
+}
+
 void
 work_drain (void)
 {
+  struct pollfd pfd = { 0 };
   if (!g.nthread)
     return;
+  pfd.fd = g.event;
+  pfd.events = POLLIN;
   pthread_mutex_lock (&g.lock);
   while (g.active)
-    pthread_cond_wait (&g.drained, &g.lock);
+    {
+      pthread_mutex_unlock (&g.lock);
+      work_hnd ();
+      pthread_mutex_lock (&g.lock);
+      bool done = !g.active;
+      pthread_mutex_unlock (&g.lock);
+      if (done)
+        break;
+      poll (&pfd, 1, -1);
+      pthread_mutex_lock (&g.lock);
+    }
   pthread_mutex_unlock (&g.lock);
 }
 
@@ -227,6 +305,8 @@ work_stop (void)
         pthread_join (g.thread[i], NULL);
     }
   free (g.thread);
+  if (g.event >= 0)
+    close (g.event);
   pthread_cond_destroy (&g.drained);
   pthread_cond_destroy (&g.ready);
   pthread_cond_destroy (&g.space);
