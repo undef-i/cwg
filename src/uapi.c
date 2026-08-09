@@ -75,14 +75,15 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
     {
       if (!u64_get (val, UINT16_MAX, &n))
         return -EINVAL;
-      if (dev_bind (d, (uint16_t)n, d->mark) < 0)
+      d->bind_port = (uint16_t)n;
+      if (d->up && dev_bind (d, d->bind_port, d->mark) < 0)
         return errno == EADDRINUSE ? -EADDRINUSE : -EIO;
     }
   else if (!strcmp (key, "fwmark"))
     {
       if (!u64_get (val, UINT32_MAX, &n))
         return -EINVAL;
-      if (udp_mark (d->udp4, d->udp6, (uint32_t)n) < 0)
+      if (d->up && udp_mark (d->udp4, d->udp6, (uint32_t)n) < 0)
         return -EIO;
       d->mark = (uint32_t)n;
     }
@@ -100,7 +101,6 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
 static int
 peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
 {
-  uint64_t n;
   if (!strcmp (key, "update_only"))
     {
       if (strcmp (val, "true"))
@@ -144,11 +144,12 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
     }
   else if (!strcmp (key, "persistent_keepalive_interval"))
     {
-      uint16_t old = sp->p->ka;
-      if (!u64_get (val, UINT16_MAX, &n))
+      AwgRange old = sp->p->ka;
+      if (awg_range_set (&sp->p->ka, val) < 0)
         return -EINVAL;
-      sp->p->ka = (uint16_t)n;
-      if (!old && sp->p->ka)
+      if (!(sp->p->ka.lo || sp->p->ka.hi))
+        atomic_store_explicit (&sp->p->pka_due, 0, memory_order_relaxed);
+      if (!(old.lo || old.hi) && (sp->p->ka.lo || sp->p->ka.hi))
         data_keepalive (d, sp->p);
     }
   else if (!strcmp (key, "replace_allowed_ips"))
@@ -235,8 +236,8 @@ get_run (Dev *d, FILE *f)
       key_hex (hex, d->sk);
       fprintf (f, "private_key=%s\n", hex);
     }
-  if (d->port)
-    fprintf (f, "listen_port=%u\n", d->port);
+  if (d->bind_port)
+    fprintf (f, "listen_port=%u\n", d->bind_port);
   if (d->mark)
     fprintf (f, "fwmark=%u\n", d->mark);
   if (d->awg.jc)
@@ -251,6 +252,20 @@ get_run (Dev *d, FILE *f)
       fprintf (f, "content_padding_addition=%s\n",
                awg_range_get (&d->awg.content_pad, range));
     }
+  const struct { const char *name; const AwgRange *range; } timings[] = {
+    { "rekey_after_time", &d->awg.rekey_after },
+    { "rekey_timeout", &d->awg.rekey_timeout },
+    { "reject_after_time", &d->awg.reject_after },
+    { "keepalive_timeout", &d->awg.keepalive_timeout },
+    { "max_handshake_attempts", &d->awg.max_handshake_attempts },
+  };
+  for (size_t i = 0; i < sizeof (timings) / sizeof (timings[0]); i++)
+    if (timings[i].range->lo || timings[i].range->hi)
+      {
+        char range[32];
+        fprintf (f, "%s=%s\n", timings[i].name,
+                 awg_range_get (timings[i].range, range));
+      }
   for (unsigned i = 0; i < AWG_TYPE_N; i++)
     {
       char range[32];
@@ -279,14 +294,18 @@ get_run (Dev *d, FILE *f)
     fprintf (f,
              "last_handshake_time_sec=%llu\n"
              "last_handshake_time_nsec=%llu\n"
-             "tx_bytes=%llu\nrx_bytes=%llu\n"
-             "persistent_keepalive_interval=%u\n",
+             "tx_bytes=%llu\nrx_bytes=%llu\n",
              (unsigned long long)p->hs_s, (unsigned long long)p->hs_ns,
              (unsigned long long)atomic_load_explicit (&p->tx,
-                                                       memory_order_relaxed),
+                                                        memory_order_relaxed),
              (unsigned long long)atomic_load_explicit (&p->rx,
-                                                       memory_order_relaxed),
-             p->ka);
+                                                        memory_order_relaxed));
+    if (p->ka.lo || p->ka.hi)
+      {
+        char range[32];
+        fprintf (f, "persistent_keepalive_interval=%s\n",
+                 awg_range_get (&p->ka, range));
+      }
     for (Aip *a = d->aip; a; a = a->next)
       {
         char ip[INET6_ADDRSTRLEN];
@@ -311,19 +330,26 @@ conn_hnd (Dev *d, int fd)
     {
       int rc;
       if (!strcmp (op, "set=1\n"))
-        rc = set_run (d, f);
+        {
+          pthread_rwlock_wrlock (&d->lock);
+          rc = set_run (d, f);
+          pthread_rwlock_unlock (&d->lock);
+        }
       else if (!strcmp (op, "get=1\n"))
         {
           int c = fgetc (f);
           rc = c == '\n' ? 0 : -EINVAL;
           if (!rc)
-            get_run (d, f);
+            {
+              pthread_rwlock_rdlock (&d->lock);
+              get_run (d, f);
+              pthread_rwlock_unlock (&d->lock);
+            }
         }
       else
         break;
       fprintf (f, "errno=%d\n\n", rc < 0 ? -rc : rc);
       fflush (f);
-      break;
     }
   free (op);
   fclose (f);
@@ -420,9 +446,7 @@ uapi_hnd (Dev *d)
       setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
       setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
       work_drain ();
-      pthread_rwlock_wrlock (&d->lock);
       conn_hnd (d, fd);
-      pthread_rwlock_unlock (&d->lock);
     }
 }
 

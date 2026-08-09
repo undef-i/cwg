@@ -22,9 +22,23 @@ enum
   REJECT_MS = 180000,
   RETRY_MS = 5000,
   RETRY_JITTER_MS = 334,
-  RETRY_STOP_MS = 90000,
   KEEPALIVE_MS = 10000,
 };
+
+static uint64_t
+awg_ms (const AwgRange *r, uint32_t fallback)
+{
+  return (uint64_t)awg_range_pick (r, fallback / 1000U) * 1000U;
+}
+
+static void
+pka_arm (Peer *p, uint64_t now)
+{
+  if (p->ka.lo || p->ka.hi)
+    atomic_store_explicit (&p->pka_due,
+                           now + (uint64_t)awg_range_pick (&p->ka, 0) * 1000U,
+                           memory_order_relaxed);
+}
 
 uint64_t
 data_now (void)
@@ -55,6 +69,7 @@ send_pkt (Dev *d, Peer *p, const void *buf, size_t len, bool auth)
           atomic_store_explicit (&p->last_tx, data_now (),
                                  memory_order_relaxed);
           atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
+          pka_arm (p, data_now ());
         }
       return true;
     }
@@ -64,24 +79,28 @@ send_pkt (Dev *d, Peer *p, const void *buf, size_t len, bool auth)
 static void
 awg_handshake_preamble (Dev *d, Peer *p)
 {
-  uint8_t buf[AWG_JUNK_MAX];
+  uint8_t *buf = malloc (AWG_PACKET_MAX);
+  if (!buf)
+    return;
   for (unsigned i = 0; i < 5; i++)
     {
       size_t len;
       if (d->awg.i[i][0]
-          && awg_i_make (&d->awg, i, buf, &len, sizeof (buf)) == 0 && len)
+          && awg_i_make (&d->awg, i, buf, &len, AWG_PACKET_MAX) == 0 && len)
         send_pkt (d, p, buf, len, false);
     }
-  for (unsigned i = 0; i < d->awg.jc; i++)
+  for (uint32_t i = 0; i < d->awg.jc; i++)
     {
       size_t len = d->awg.jmin;
       if (d->awg.jmax > d->awg.jmin)
         len += randombytes_uniform (d->awg.jmax - d->awg.jmin);
-      if (len > sizeof (buf))
+      if (len > AWG_PACKET_MAX)
         continue;
       randombytes_buf (buf, len);
       send_pkt (d, p, buf, len, false);
     }
+  sodium_memzero (buf, AWG_PACKET_MAX);
+  free (buf);
 }
 
 static void
@@ -158,22 +177,27 @@ static bool
 mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
         size_t mac2_off, uint32_t sender)
 {
-  uint8_t out[sizeof (MsgCookie) + 1024U];
+  size_t cap = sizeof (MsgCookie) + d->awg.s[AWG_COOKIE];
+  uint8_t *out = malloc (cap);
   MsgCookie *r = (void *)out;
   uint8_t cookie[COOKIE_LEN];
   int fd;
-  if (!d->has_sk
+  if (!out || !d->has_sk
       || !cookie_mac1_check ((const uint8_t *)msg + mac_off, d->mac1_key, msg,
-                             mac_off))
-    return false;
+                              mac_off))
+    goto out;
   if (!hs_load (d))
-    return true;
+    {
+      free (out);
+      return true;
+    }
   if (!cookie_make (d, src, cookie))
-    return false;
+    goto out;
   if (cookie_mac2_check ((const uint8_t *)msg + mac2_off, cookie, msg,
                          mac2_off))
     {
       sodium_memzero (cookie, sizeof (cookie));
+      free (out);
       return true;
     }
   awg_type_set (&d->awg, AWG_COOKIE, r);
@@ -183,16 +207,22 @@ mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
                              r->nonce, d->cookie_key))
     {
       sodium_memzero (cookie, sizeof (cookie));
-      return false;
+      goto out;
     }
   fd = sock (d, src);
   if (fd >= 0)
     {
       size_t len = sizeof (*r);
-      if (awg_wrap (&d->awg, AWG_COOKIE, out, &len, sizeof (out)) == 0)
+      if (awg_wrap (&d->awg, AWG_COOKIE, out, &len, cap) == 0)
         udp_send (fd, src, out, len);
     }
+out:
   sodium_memzero (cookie, sizeof (cookie));
+  if (out)
+    {
+      sodium_memzero (out, cap);
+      free (out);
+    }
   return false;
 }
 
@@ -260,9 +290,9 @@ kp_set (Dev *d, Peer *p, bool initiator)
 }
 
 static bool
-kp_live (const Kp *k, uint64_t now)
+kp_live (const Dev *d, const Kp *k, uint64_t now)
 {
-  return k->ok && now - k->born < REJECT_MS
+  return k->ok && now - k->born < awg_ms (&d->awg.reject_after, REJECT_MS)
          && atomic_load_explicit (&k->cnt, memory_order_relaxed)
                 < REPLAY_LIMIT;
 }
@@ -272,7 +302,7 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
 {
   uint8_t *out;
   MsgData *m;
-  size_t pad = len + awg_content_pad (&d->awg, len, 0), n;
+  size_t pad = len + awg_content_pad (&d->awg, len, d->mtu), n;
   uint8_t key[KEY_LEN];
   Ep ep;
   uint64_t cnt;
@@ -283,7 +313,7 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
     return false;
   m = (void *)out;
   pthread_mutex_lock (&d->data_lock);
-  if (!kp_live (&p->kp, data_now ()))
+  if (!kp_live (d, &p->kp, data_now ()))
     {
       pthread_mutex_unlock (&d->data_lock);
       free (out);
@@ -336,13 +366,13 @@ static bool
 out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
 {
   uint64_t cnt;
-  size_t pad = len + awg_content_pad (&d->awg, len, 0);
+  size_t pad = len + awg_content_pad (&d->awg, len, d->mtu);
   if (sizeof (MsgData) + pad + TAG_LEN + d->awg.s[AWG_DATA]
       > sizeof (j->buf))
     return false;
   memset (j, 0, offsetof (WorkJob, buf));
   pthread_mutex_lock (&d->data_lock);
-  if (!kp_live (&p->kp, data_now ()))
+  if (!kp_live (d, &p->kp, data_now ()))
     {
       pthread_mutex_unlock (&d->data_lock);
       return false;
@@ -416,14 +446,15 @@ flush (Dev *d, Peer *p)
 static void
 init_send (Dev *d, Peer *p, bool retry)
 {
-  uint8_t buf[sizeof (MsgInit) + AWG_PAD_MAX];
+  size_t cap = sizeof (MsgInit) + d->awg.s[AWG_INIT];
+  uint8_t *buf = malloc (cap);
   MsgInit *m = (void *)buf;
   uint8_t last[sizeof (p->hs.last)];
   uint32_t li;
-  if (!d->has_sk || !p->addr.len)
-    return;
+  if (!buf || !d->has_sk || !p->addr.len)
+    goto out;
   if (p->hs_pending && !retry)
-    return;
+    goto out;
   if (p->hs.li)
     idx_del (&d->idx, p->hs.li);
   memcpy (last, p->hs.last, sizeof (last));
@@ -435,19 +466,31 @@ init_send (Dev *d, Peer *p, bool retry)
     {
       idx_del (&d->idx, li);
       p->hs.li = 0;
-      return;
+      goto out;
     }
   awg_type_set (&d->awg, AWG_INIT, m);
   mac_add (p, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2));
   size_t len = sizeof (*m);
   awg_handshake_preamble (d, p);
-  if (awg_wrap (&d->awg, AWG_INIT, buf, &len, sizeof (buf)) == 0)
+  if (awg_wrap (&d->awg, AWG_INIT, buf, &len, cap) == 0)
     send_pkt (d, p, buf, len, true);
   uint64_t now = data_now ();
   if (!p->hs_pending)
-    p->hs_start = now;
+    {
+      p->hs_start = now;
+      p->hs_attempts = 0;
+      p->hs_max_attempts
+          = awg_range_pick (&d->awg.max_handshake_attempts, 18);
+    }
   p->hs_pending = true;
-  p->hs_next = now + RETRY_MS + randombytes_uniform (RETRY_JITTER_MS);
+  p->hs_next = now + awg_ms (&d->awg.rekey_timeout, RETRY_MS)
+               + randombytes_uniform (RETRY_JITTER_MS);
+out:
+  if (buf)
+    {
+      sodium_memzero (buf, cap);
+      free (buf);
+    }
 }
 
 void
@@ -524,11 +567,15 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
   HASH_ITER (hh, d->peer, p, tmp)
   {
     Noise n = p->hs;
-    uint8_t buf[sizeof (MsgResp) + AWG_PAD_MAX];
+    size_t cap = sizeof (MsgResp) + d->awg.s[AWG_RESP];
+    uint8_t *buf = malloc (cap);
     MsgResp *r = (void *)buf;
     uint32_t li;
-    if (!noise_init_get (&n, m))
-      continue;
+    if (!buf || !noise_init_get (&n, m))
+      {
+        free (buf);
+        continue;
+      }
     if (p->hs.li)
       idx_del (&d->idx, p->hs.li);
     p->hs = n;
@@ -537,21 +584,28 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
       {
         idx_del (&d->idx, li);
         p->hs.li = 0;
+        sodium_memzero (buf, cap);
+        free (buf);
         return;
       }
     roam (p, src);
     atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
     atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
+    pka_arm (p, data_now ());
     awg_type_set (&d->awg, AWG_RESP, r);
     mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
     if (!idx_fnd (d->idx, li) || !kp_set (d, p, false))
       {
         idx_del (&d->idx, li);
+        sodium_memzero (buf, cap);
+        free (buf);
         return;
       }
     size_t len = sizeof (*r);
-    if (awg_wrap (&d->awg, AWG_RESP, buf, &len, sizeof (buf)) == 0)
+    if (awg_wrap (&d->awg, AWG_RESP, buf, &len, cap) == 0)
       send_pkt (d, p, buf, len, true);
+    sodium_memzero (buf, cap);
+    free (buf);
     return;
   }
 }
@@ -573,10 +627,13 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   roam (p, src);
   atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
+  pka_arm (p, data_now ());
   hs_time (p);
   p->hs_pending = false;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->hs_attempts = 0;
+  p->hs_max_attempts = 0;
   data_send (d, p, NULL, 0);
   flush (d, p);
 }
@@ -632,7 +689,8 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
       return;
     }
   k = e->ptr;
-  if (!k->ok || now - k->born >= REJECT_MS || cnt >= REPLAY_LIMIT)
+  if (!k->ok || now - k->born >= awg_ms (&d->awg.reject_after, REJECT_MS)
+      || cnt >= REPLAY_LIMIT)
     {
       pthread_mutex_unlock (&d->data_lock);
       return;
@@ -664,9 +722,12 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
   roam (p, src);
   atomic_fetch_add_explicit (&p->rx, len, memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
+  pka_arm (p, now);
   p->hs_pending = false;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->hs_attempts = 0;
+  p->hs_max_attempts = 0;
   if (promoted)
     hs_time (p);
   pthread_mutex_unlock (&d->data_lock);
@@ -691,7 +752,10 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
     return;
   if (iplen > n || aip_fnd (d, af, sip) != p)
     return;
-  atomic_store_explicit (&p->ka_due, now + KEEPALIVE_MS, memory_order_relaxed);
+  atomic_store_explicit (&p->ka_due,
+                         now + awg_ms (&d->awg.keepalive_timeout,
+                                       KEEPALIVE_MS),
+                         memory_order_relaxed);
   tun_write (d->tun, plain, iplen);
 }
 
@@ -711,16 +775,14 @@ data_tick (Dev *d, uint64_t now)
   Peer *p, *tmp;
   HASH_ITER (hh, d->peer, p, tmp)
   {
-    uint64_t tx = atomic_load_explicit (&p->last_tx, memory_order_relaxed);
-    uint64_t rx = atomic_load_explicit (&p->last_rx, memory_order_relaxed);
-    uint64_t last = tx > rx ? tx : rx;
-    if (p->prev.ok && now - p->prev.born >= REJECT_MS)
+    uint64_t reject = awg_ms (&d->awg.reject_after, REJECT_MS);
+    if (p->prev.ok && now - p->prev.born >= reject)
       kp_drop (d, &p->prev);
-    if (p->pending.ok && now - p->pending.born >= REJECT_MS)
+    if (p->pending.ok && now - p->pending.born >= reject)
       kp_drop (d, &p->pending);
-    if (p->kp.ok && now - p->kp.born >= REJECT_MS)
+    if (p->kp.ok && now - p->kp.born >= reject)
       kp_drop (d, &p->kp);
-    if (p->hs_pending && now - p->hs_start >= RETRY_STOP_MS)
+    if (p->hs_pending && p->hs_attempts > p->hs_max_attempts)
       {
         if (p->hs.li)
           idx_del (&d->idx, p->hs.li);
@@ -728,6 +790,8 @@ data_tick (Dev *d, uint64_t now)
         p->hs_pending = false;
         p->hs_start = 0;
         p->hs_next = 0;
+        p->hs_attempts = 0;
+        p->hs_max_attempts = 0;
         uint8_t last[sizeof (p->hs.last)];
         memcpy (last, p->hs.last, sizeof (last));
         noise_init (&p->hs, d->sk, p->pk, p->psk);
@@ -736,19 +800,21 @@ data_tick (Dev *d, uint64_t now)
         purge (p);
       }
     else if (p->hs_pending && now >= p->hs_next)
-      init_send (d, p, true);
+      {
+        p->hs_attempts++;
+        init_send (d, p, true);
+      }
     else if (!p->hs_pending && p->kp.ok && p->kp.initiator
-             && now - p->kp.born >= REKEY_MS)
+              && now - p->kp.born
+                     >= awg_ms (&d->awg.rekey_after, REKEY_MS))
       init_send (d, p, false);
     uint64_t due = atomic_load_explicit (&p->ka_due, memory_order_relaxed);
     if (due && now >= due)
       {
         data_keepalive (d, p);
-        tx = atomic_load_explicit (&p->last_tx, memory_order_relaxed);
-        rx = atomic_load_explicit (&p->last_rx, memory_order_relaxed);
-        last = tx > rx ? tx : rx;
       }
-    if (p->ka && (!last || now - last >= (uint64_t)p->ka * 1000U))
+    uint64_t pka = atomic_load_explicit (&p->pka_due, memory_order_relaxed);
+    if (pka && now >= pka)
       data_keepalive (d, p);
   }
 }
@@ -791,7 +857,9 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
       pthread_mutex_lock (&d->data_lock);
       e = idx_fnd (d->idx, job->index);
       if (!e || e->type != IDX_KP || !(k = e->ptr) || !k->ok
-          || data_now () - k->born >= REJECT_MS || job->cnt >= REPLAY_LIMIT)
+          || data_now () - k->born
+                 >= awg_ms (&d->awg.reject_after, REJECT_MS)
+          || job->cnt >= REPLAY_LIMIT)
         {
           pthread_mutex_unlock (&d->data_lock);
           pthread_rwlock_unlock (&d->lock);
@@ -859,7 +927,8 @@ data_work (WorkJob *j)
         .cnt = htole64 (j->cnt),
       };
       size_t plain = j->len;
-      size_t pad = plain + awg_content_pad (&j->dev->awg, plain, 0);
+      size_t pad = plain + awg_content_pad (&j->dev->awg, plain,
+                                             j->dev->mtu);
       size_t n;
       memmove (j->buf + sizeof (m), j->buf, plain);
       awg_type_set (&j->dev->awg, AWG_DATA, &m);
@@ -942,7 +1011,10 @@ data_commit (WorkJob *j)
         goto out;
       if (iplen <= j->len && aip_fnd (d, af, sip) == p)
         {
-          atomic_store_explicit (&p->ka_due, now + KEEPALIVE_MS,
+          pka_arm (p, now);
+          atomic_store_explicit (&p->ka_due,
+                                 now + awg_ms (&d->awg.keepalive_timeout,
+                                               KEEPALIVE_MS),
                                  memory_order_relaxed);
           tun_write (d->tun, j->buf, iplen);
         }

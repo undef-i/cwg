@@ -4,9 +4,7 @@
 
 enum
 {
-  AWG_PAD_MAX = 1024,
-  AWG_JUNK_MAX = 1280,
-  AWG_JUNK_COUNT_MAX = 128,
+  AWG_PACKET_MAX = 65535,
   AWG_INIT = 0,
   AWG_RESP,
   AWG_COOKIE,
@@ -28,9 +26,14 @@ typedef struct
   uint32_t jmin;
   uint32_t jmax;
   AwgRange content_pad;
+  AwgRange rekey_after;
+  AwgRange rekey_timeout;
+  AwgRange reject_after;
+  AwgRange keepalive_timeout;
+  AwgRange max_handshake_attempts;
   uint8_t hp_key[KEY_LEN];
   bool hp;
-  char i[5][1024];
+  char i[5][AWG_PACKET_MAX + 1U];
 } Awg;
 
 void awg_init (Awg *a);
@@ -47,3 +50,4 @@ int awg_unwrap (const Awg *a, uint8_t *buf, size_t *len, unsigned *type);
 int awg_i_make (const Awg *a, unsigned index, uint8_t *out, size_t *len,
                 size_t cap);
 size_t awg_content_pad (const Awg *a, size_t len, size_t mtu);
+uint32_t awg_range_pick (const AwgRange *r, uint32_t fallback);

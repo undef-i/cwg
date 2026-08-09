@@ -174,12 +174,13 @@ main (int argc, char **argv)
       err ("%s: tun: %s", name, strerror (errno));
       goto out;
     }
+  d->mtu = tun_mtu (name);
   if ((inherited ? uapi_adopt (d, uapi_fd) : uapi_open (d)) < 0)
     {
       err ("%s: uapi: %s", name, strerror (errno));
       goto out;
     }
-  if (dev_bind (d, 0, 0) < 0)
+  if (dev_up (d, tun_up (name)) < 0)
     {
       err ("%s: udp: %s", name, strerror (errno));
       goto out;

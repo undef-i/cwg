@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <sys/socket.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -52,6 +53,36 @@ tun_adopt (int fd, const char *name)
       || fcntl (fd, F_SETFD, flags | FD_CLOEXEC) < 0)
     return -1;
   return fd;
+}
+
+int
+tun_mtu (const char *name)
+{
+  struct ifreq ifr = { 0 };
+  int fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  int mtu = 0;
+  if (fd < 0)
+    return 0;
+  snprintf (ifr.ifr_name, sizeof (ifr.ifr_name), "%s", name);
+  if (ioctl (fd, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0)
+    mtu = ifr.ifr_mtu;
+  close (fd);
+  return mtu;
+}
+
+bool
+tun_up (const char *name)
+{
+  struct ifreq ifr = { 0 };
+  int fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  bool up = false;
+  if (fd < 0)
+    return false;
+  snprintf (ifr.ifr_name, sizeof (ifr.ifr_name), "%s", name);
+  if (ioctl (fd, SIOCGIFFLAGS, &ifr) == 0)
+    up = (ifr.ifr_flags & IFF_UP) != 0;
+  close (fd);
+  return up;
 }
 
 ssize_t

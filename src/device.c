@@ -63,8 +63,11 @@ dev_peer_reset (Dev *d, Peer *p)
   p->last_tx = 0;
   p->last_rx = 0;
   p->ka_due = 0;
+  p->pka_due = 0;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->hs_attempts = 0;
+  p->hs_max_attempts = 0;
   p->hs_pending = false;
   if (d->has_sk)
     noise_init (&p->hs, d->sk, p->pk, p->psk);
@@ -223,7 +226,27 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
   d->udp4 = fd4;
   d->udp6 = fd6;
   d->port = actual;
+  d->bind_port = actual;
   d->mark = mark;
   d->udp_gen++;
+  return 0;
+}
+
+int
+dev_up (Dev *d, bool up)
+{
+  if (d->up == up)
+    return 0;
+  if (!up)
+    {
+      d->up = false;
+      udp_close (d->udp4, d->udp6);
+      d->udp4 = d->udp6 = -1;
+      d->udp_gen++;
+      return 0;
+    }
+  if (dev_bind (d, d->bind_port, d->mark) < 0)
+    return -1;
+  d->up = true;
   return 0;
 }

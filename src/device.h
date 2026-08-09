@@ -48,7 +48,7 @@ struct Peer
   uint8_t psk[KEY_LEN];
   char ep[256];
   Ep addr;
-  uint16_t ka;
+  AwgRange ka;
   uint64_t hs_s;
   uint64_t hs_ns;
   atomic_uint_fast64_t tx;
@@ -56,8 +56,11 @@ struct Peer
   atomic_uint_fast64_t last_tx;
   atomic_uint_fast64_t last_rx;
   atomic_uint_fast64_t ka_due;
+  atomic_uint_fast64_t pka_due;
   uint64_t hs_start;
   uint64_t hs_next;
+  uint32_t hs_attempts;
+  uint32_t hs_max_attempts;
   bool hs_pending;
   Noise hs;
   Kp kp;
@@ -91,6 +94,7 @@ struct Dev
   int uapi;
   int udp4;
   int udp6;
+  int mtu;
   uint64_t udp_gen;
   uint64_t udp_seen;
   uint8_t sk[KEY_LEN];
@@ -103,7 +107,9 @@ struct Dev
   unsigned hs_count;
   bool has_sk;
   uint16_t port;
+  uint16_t bind_port;
   uint32_t mark;
+  bool up;
   Awg awg;
   Peer *peer;
   Peer *retired;
@@ -124,3 +130,4 @@ void dev_reap (Dev *d);
 void dev_key_set (Dev *d, const uint8_t sk[KEY_LEN]);
 void dev_peer_reset (Dev *d, Peer *p);
 int dev_bind (Dev *d, uint16_t port, uint32_t mark);
+int dev_up (Dev *d, bool up);

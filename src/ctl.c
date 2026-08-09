@@ -52,7 +52,8 @@ dev_add (Dev **head, int ep, const char *name, const char *socket_dir)
     goto fail;
   if (uapi_open (d) < 0)
     goto fail;
-  if (dev_bind (d, 0, 0) < 0)
+  d->mtu = tun_mtu (name);
+  if (dev_up (d, tun_up (name)) < 0)
     goto fail;
   ev.data.fd = d->tun;
   if (epoll_ctl (ep, EPOLL_CTL_ADD, d->tun, &ev) < 0)
@@ -63,12 +64,15 @@ dev_add (Dev **head, int ep, const char *name, const char *socket_dir)
       epoll_ctl (ep, EPOLL_CTL_DEL, d->tun, NULL);
       goto fail;
     }
-  ev.data.fd = d->udp4;
-  if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
-    goto fail;
-  ev.data.fd = d->udp6;
-  if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
-    goto fail;
+  if (d->udp4 >= 0)
+    {
+      ev.data.fd = d->udp4;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
+        goto fail;
+      ev.data.fd = d->udp6;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
+        goto fail;
+    }
   d->udp_seen = d->udp_gen;
   d->next = *head;
   *head = d;

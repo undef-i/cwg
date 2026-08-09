@@ -144,12 +144,15 @@ loop_run (Dev *head, int ctl)
       ev.data.fd = d->uapi;
       if (epoll_ctl (ep, EPOLL_CTL_ADD, d->uapi, &ev) < 0)
         goto fail;
-      ev.data.fd = d->udp4;
-      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
-        goto fail;
-      ev.data.fd = d->udp6;
-      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
-        goto fail;
+      if (d->udp4 >= 0)
+        {
+          ev.data.fd = d->udp4;
+          if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
+            goto fail;
+          ev.data.fd = d->udp6;
+          if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
+            goto fail;
+        }
       d->udp_seen = d->udp_gen;
     }
 
@@ -229,12 +232,15 @@ loop_run (Dev *head, int ctl)
                 dev_del (&head, d, ep);
               else if (d->udp_seen != d->udp_gen)
                 {
-                  ev.data.fd = d->udp4;
-                  if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
-                    goto fail;
-                  ev.data.fd = d->udp6;
-                  if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
-                    goto fail;
+                  if (d->udp4 >= 0)
+                    {
+                      ev.data.fd = d->udp4;
+                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
+                        goto fail;
+                      ev.data.fd = d->udp6;
+                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
+                        goto fail;
+                    }
                   d->udp_seen = d->udp_gen;
                 }
               continue;
@@ -283,12 +289,39 @@ loop_run (Dev *head, int ctl)
             }
         }
       uint64_t now = data_now ();
-      for (Dev *d = head; d; d = d->next)
+      for (Dev *d = head; d;)
         {
-          pthread_rwlock_wrlock (&d->lock);
-          data_tick (d, now);
-          pthread_rwlock_unlock (&d->lock);
-          dev_reap (d);
+          Dev *next = d->next;
+          if (!socket_alive (d))
+            dev_del (&head, d, ep);
+          else
+            {
+              d->mtu = tun_mtu (d->name);
+              if (dev_up (d, tun_up (d->name)) < 0)
+                {
+                  dev_del (&head, d, ep);
+                  d = next;
+                  continue;
+                }
+              if (d->udp_seen != d->udp_gen)
+                {
+                  if (d->udp4 >= 0)
+                    {
+                      ev.data.fd = d->udp4;
+                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
+                        goto fail;
+                      ev.data.fd = d->udp6;
+                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
+                        goto fail;
+                    }
+                  d->udp_seen = d->udp_gen;
+                }
+              pthread_rwlock_wrlock (&d->lock);
+              data_tick (d, now);
+              pthread_rwlock_unlock (&d->lock);
+              dev_reap (d);
+            }
+          d = next;
         }
     }
   dev_all_del (&head, ep);
