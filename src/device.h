@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aip.h"
+#include "awg.h"
 #include "common.h"
 #include "cookie.h"
 #include "idx.h"
@@ -84,6 +85,7 @@ struct Peer
 struct Dev
 {
   char name[IFNAMSIZ];
+  char socket_dir[32];
   char sock[108];
   int tun;
   int uapi;
@@ -102,6 +104,7 @@ struct Dev
   bool has_sk;
   uint16_t port;
   uint32_t mark;
+  Awg awg;
   Peer *peer;
   Peer *retired;
   Aip *aip;

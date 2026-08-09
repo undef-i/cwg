@@ -18,6 +18,9 @@
 #ifndef TUNSETIFF
 #define TUNSETIFF _IOW ('T', 202, int)
 #endif
+#ifndef TUNGETIFF
+#define TUNGETIFF _IOR ('T', 210, unsigned int)
+#endif
 
 int
 tun_open (const char *name)
@@ -33,6 +36,21 @@ tun_open (const char *name)
       close (fd);
       return -1;
     }
+  return fd;
+}
+
+int
+tun_adopt (int fd, const char *name)
+{
+  struct ifreq ifr = { 0 };
+  int flags;
+  if (fd < 0 || ioctl (fd, (int)TUNGETIFF, &ifr) < 0
+      || strncmp (ifr.ifr_name, name, IFNAMSIZ)
+      || (flags = fcntl (fd, F_GETFL)) < 0
+      || fcntl (fd, F_SETFL, flags | O_NONBLOCK) < 0
+      || (flags = fcntl (fd, F_GETFD)) < 0
+      || fcntl (fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+    return -1;
   return fd;
 }
 

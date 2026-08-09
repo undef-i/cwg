@@ -11,9 +11,17 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop;
+
+static bool
+socket_alive (const Dev *d)
+{
+  struct stat st;
+  return d->sock[0] && !lstat (d->sock, &st) && S_ISSOCK (st.st_mode);
+}
 
 void
 loop_stop (void)
@@ -90,6 +98,7 @@ loop_run (Dev *head, int ctl)
   UdpPacket *pkt = calloc (UDP_BATCH_MAX, sizeof (*pkt));
   int ep = epoll_create1 (EPOLL_CLOEXEC);
   int ino = inotify_init1 (IN_CLOEXEC | IN_NONBLOCK);
+  int wg_watch = -1, awg_watch = -1;
   if (ep < 0 || ino < 0 || !buf || !pkt)
     {
       free (pkt);
@@ -111,13 +120,19 @@ loop_run (Dev *head, int ctl)
 
   ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
   ev.data.fd = ctl;
-  if (epoll_ctl (ep, EPOLL_CTL_ADD, ctl, &ev) < 0)
+  if (ctl >= 0 && epoll_ctl (ep, EPOLL_CTL_ADD, ctl, &ev) < 0)
     goto fail;
-  if (inotify_add_watch (ino, SOCKET_DIR, IN_DELETE) < 0)
+  if ((mkdir (WG_SOCKET_DIR, 0755) < 0 && errno != EEXIST)
+      || (mkdir (AWG_SOCKET_DIR, 0755) < 0 && errno != EEXIST)
+      || (wg_watch = inotify_add_watch (ino, WG_SOCKET_DIR, IN_DELETE)) < 0
+      || (awg_watch = inotify_add_watch (ino, AWG_SOCKET_DIR, IN_DELETE)) < 0)
     goto fail;
   ev.data.fd = ino;
   if (epoll_ctl (ep, EPOLL_CTL_ADD, ino, &ev) < 0)
     goto fail;
+  for (Dev *d = head; d; d = d->next)
+    if (!socket_alive (d))
+      goto fail;
   ev.data.fd = work_fd ();
   if (epoll_ctl (ep, EPOLL_CTL_ADD, work_fd (), &ev) < 0)
     goto fail;
@@ -150,7 +165,7 @@ loop_run (Dev *head, int ctl)
       for (int i = 0; i < n; i++)
         {
           int kind = FD_NONE;
-          if (arr[i].data.fd == ctl)
+          if (ctl >= 0 && arr[i].data.fd == ctl)
             {
               if (ctl_hnd (ctl, &head, ep) < 0)
                 goto fail;
@@ -166,12 +181,33 @@ loop_run (Dev *head, int ctl)
                     struct inotify_event *ie
                         = (struct inotify_event *)(ibuf + off);
                     Dev *d;
+                    if (ie->mask & IN_Q_OVERFLOW)
+                      {
+                        for (d = head; d;)
+                          {
+                            Dev *next = d->next;
+                            if (!socket_alive (d))
+                              dev_del (&head, d, ep);
+                            d = next;
+                          }
+                        off += sizeof (*ie) + ie->len;
+                        continue;
+                      }
                     for (d = head; d; d = d->next)
-                      if ((ie->mask & IN_DELETE) && ie->len
-                          && !strcmp (ie->name, d->sock + strlen (SOCKET_DIR) + 1))
                         {
-                          dev_del (&head, d, ep);
-                          break;
+                          const char *base = strrchr (d->sock, '/');
+                          bool same_dir
+                              = (ie->wd == wg_watch
+                                 && !strcmp (d->socket_dir, WG_SOCKET_DIR))
+                                || (ie->wd == awg_watch
+                                    && !strcmp (d->socket_dir,
+                                                AWG_SOCKET_DIR));
+                          if ((ie->mask & IN_DELETE) && ie->len && base
+                              && same_dir && !strcmp (ie->name, base + 1))
+                            {
+                              dev_del (&head, d, ep);
+                              break;
+                            }
                         }
                     off += sizeof (*ie) + ie->len;
                   }

@@ -21,7 +21,7 @@ DEP = $(OBJ:.o=.d)
 
 CFLAGS = -std=gnu11 -O3 -flto -Wall -Wextra -Wpedantic \
 	-ffunction-sections -fdata-sections -fomit-frame-pointer \
-	-D_GNU_SOURCE -DSOCKET_DIR=\"/var/run/wireguard\" \
+	-D_GNU_SOURCE \
 	-Isrc -Iext/uthash/src -Iext/blake2/ref -I$(SODIUM_INC)
 LDFLAGS = -static -pthread -flto -s -Wl,--gc-sections
 

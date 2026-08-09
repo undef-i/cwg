@@ -1,5 +1,6 @@
 #include "data.h"
 
+#include "awg.h"
 #include "cookie.h"
 #include "crypto.h"
 #include "tun.h"
@@ -58,6 +59,29 @@ send_pkt (Dev *d, Peer *p, const void *buf, size_t len, bool auth)
       return true;
     }
   return false;
+}
+
+static void
+awg_handshake_preamble (Dev *d, Peer *p)
+{
+  uint8_t buf[AWG_JUNK_MAX];
+  for (unsigned i = 0; i < 5; i++)
+    {
+      size_t len;
+      if (d->awg.i[i][0]
+          && awg_i_make (&d->awg, i, buf, &len, sizeof (buf)) == 0 && len)
+        send_pkt (d, p, buf, len, false);
+    }
+  for (unsigned i = 0; i < d->awg.jc; i++)
+    {
+      size_t len = d->awg.jmin;
+      if (d->awg.jmax > d->awg.jmin)
+        len += randombytes_uniform (d->awg.jmax - d->awg.jmin);
+      if (len > sizeof (buf))
+        continue;
+      randombytes_buf (buf, len);
+      send_pkt (d, p, buf, len, false);
+    }
 }
 
 static void
@@ -134,7 +158,8 @@ static bool
 mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
         size_t mac2_off, uint32_t sender)
 {
-  MsgCookie r;
+  uint8_t out[sizeof (MsgCookie) + 1024U];
+  MsgCookie *r = (void *)out;
   uint8_t cookie[COOKIE_LEN];
   int fd;
   if (!d->has_sk
@@ -151,18 +176,22 @@ mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
       sodium_memzero (cookie, sizeof (cookie));
       return true;
     }
-  r.type = htole32 (MSG_COOKIE);
-  r.recv = sender;
-  randombytes_buf (r.nonce, sizeof (r.nonce));
-  if (!cookie_reply_encrypt (r.cookie, cookie, (const uint8_t *)msg + mac_off,
-                             r.nonce, d->cookie_key))
+  awg_type_set (&d->awg, AWG_COOKIE, r);
+  r->recv = sender;
+  randombytes_buf (r->nonce, sizeof (r->nonce));
+  if (!cookie_reply_encrypt (r->cookie, cookie, (const uint8_t *)msg + mac_off,
+                             r->nonce, d->cookie_key))
     {
       sodium_memzero (cookie, sizeof (cookie));
       return false;
     }
   fd = sock (d, src);
   if (fd >= 0)
-    udp_send (fd, src, &r, sizeof (r));
+    {
+      size_t len = sizeof (*r);
+      if (awg_wrap (&d->awg, AWG_COOKIE, out, &len, sizeof (out)) == 0)
+        udp_send (fd, src, out, len);
+    }
   sodium_memzero (cookie, sizeof (cookie));
   return false;
 }
@@ -243,14 +272,14 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
 {
   uint8_t *out;
   MsgData *m;
-  size_t pad = (len + 15U) & ~15U, n;
+  size_t pad = len + awg_content_pad (&d->awg, len, 0), n;
   uint8_t key[KEY_LEN];
   Ep ep;
   uint64_t cnt;
   uint32_t ri;
   int fd;
-  if (sizeof (*m) + pad + TAG_LEN > PKT_MAX
-      || !(out = malloc (sizeof (*m) + pad + TAG_LEN)))
+  if (sizeof (*m) + pad + TAG_LEN + d->awg.s[AWG_DATA] > PKT_MAX
+      || !(out = malloc (sizeof (*m) + pad + TAG_LEN + d->awg.s[AWG_DATA])))
     return false;
   m = (void *)out;
   pthread_mutex_lock (&d->data_lock);
@@ -272,7 +301,7 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
   ep = p->addr;
   fd = sock (d, &ep);
   pthread_mutex_unlock (&d->data_lock);
-  m->type = htole32 (MSG_DATA);
+  awg_type_set (&d->awg, AWG_DATA, m);
   m->recv = htole32 (ri);
   m->cnt = htole64 (cnt);
   memcpy (out + sizeof (*m), in, len);
@@ -285,6 +314,13 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
     }
   sodium_memzero (key, sizeof (key));
   size_t outlen = sizeof (*m) + n;
+  if (awg_wrap (&d->awg, AWG_DATA, out, &outlen,
+                sizeof (*m) + pad + TAG_LEN + d->awg.s[AWG_DATA]) < 0)
+    {
+      sodium_memzero (out, sizeof (*m) + n);
+      free (out);
+      return false;
+    }
   bool sent = fd >= 0 && udp_send (fd, &ep, out, outlen) == (ssize_t)outlen;
   sodium_memzero (out, outlen);
   free (out);
@@ -300,8 +336,9 @@ static bool
 out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
 {
   uint64_t cnt;
-  size_t pad = (len + 15U) & ~15U;
-  if (sizeof (MsgData) + pad + TAG_LEN > sizeof (j->buf))
+  size_t pad = len + awg_content_pad (&d->awg, len, 0);
+  if (sizeof (MsgData) + pad + TAG_LEN + d->awg.s[AWG_DATA]
+      > sizeof (j->buf))
     return false;
   memset (j, 0, offsetof (WorkJob, buf));
   pthread_mutex_lock (&d->data_lock);
@@ -379,7 +416,8 @@ flush (Dev *d, Peer *p)
 static void
 init_send (Dev *d, Peer *p, bool retry)
 {
-  MsgInit m;
+  uint8_t buf[sizeof (MsgInit) + AWG_PAD_MAX];
+  MsgInit *m = (void *)buf;
   uint8_t last[sizeof (p->hs.last)];
   uint32_t li;
   if (!d->has_sk || !p->addr.len)
@@ -393,14 +431,18 @@ init_send (Dev *d, Peer *p, bool retry)
   memcpy (p->hs.last, last, sizeof (last));
   sodium_memzero (last, sizeof (last));
   li = idx_add (&d->idx, p, IDX_HS);
-  if (!li || !noise_init_make (&p->hs, &m, li))
+  if (!li || !noise_init_make (&p->hs, m, li))
     {
       idx_del (&d->idx, li);
       p->hs.li = 0;
       return;
     }
-  mac_add (p, &m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2));
-  send_pkt (d, p, &m, sizeof (m), true);
+  awg_type_set (&d->awg, AWG_INIT, m);
+  mac_add (p, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2));
+  size_t len = sizeof (*m);
+  awg_handshake_preamble (d, p);
+  if (awg_wrap (&d->awg, AWG_INIT, buf, &len, sizeof (buf)) == 0)
+    send_pkt (d, p, buf, len, true);
   uint64_t now = data_now ();
   if (!p->hs_pending)
     p->hs_start = now;
@@ -472,16 +514,18 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
 }
 
 static void
-init_get (Dev *d, const Ep *src, const MsgInit *m)
+init_get (Dev *d, const Ep *src, MsgInit *m)
 {
   Peer *p, *tmp;
   if (!mac_ok (d, src, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2),
                m->sender))
     return;
+  awg_type_normalize (m, AWG_INIT);
   HASH_ITER (hh, d->peer, p, tmp)
   {
     Noise n = p->hs;
-    MsgResp r;
+    uint8_t buf[sizeof (MsgResp) + AWG_PAD_MAX];
+    MsgResp *r = (void *)buf;
     uint32_t li;
     if (!noise_init_get (&n, m))
       continue;
@@ -489,7 +533,7 @@ init_get (Dev *d, const Ep *src, const MsgInit *m)
       idx_del (&d->idx, p->hs.li);
     p->hs = n;
     li = idx_add (&d->idx, p, IDX_HS);
-    if (!li || !noise_resp_make (&p->hs, &r, li))
+    if (!li || !noise_resp_make (&p->hs, r, li))
       {
         idx_del (&d->idx, li);
         p->hs.li = 0;
@@ -498,19 +542,22 @@ init_get (Dev *d, const Ep *src, const MsgInit *m)
     roam (p, src);
     atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
     atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
-    mac_add (p, &r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
+    awg_type_set (&d->awg, AWG_RESP, r);
+    mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
     if (!idx_fnd (d->idx, li) || !kp_set (d, p, false))
       {
         idx_del (&d->idx, li);
         return;
       }
-    send_pkt (d, p, &r, sizeof (r), true);
+    size_t len = sizeof (*r);
+    if (awg_wrap (&d->awg, AWG_RESP, buf, &len, sizeof (buf)) == 0)
+      send_pkt (d, p, buf, len, true);
     return;
   }
 }
 
 static void
-resp_get (Dev *d, const Ep *src, const MsgResp *m)
+resp_get (Dev *d, const Ep *src, MsgResp *m)
 {
   Idx *e;
   Peer *p;
@@ -519,6 +566,7 @@ resp_get (Dev *d, const Ep *src, const MsgResp *m)
                m->sender)
       || !(e = idx_fnd (d->idx, li)) || e->type != IDX_HS)
     return;
+  awg_type_normalize (m, AWG_RESP);
   p = e->ptr;
   if (!noise_resp_get (&p->hs, m) || !kp_set (d, p, true))
     return;
@@ -706,13 +754,12 @@ data_tick (Dev *d, uint64_t now)
 }
 
 void
-data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
+data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
 {
-  uint32_t type;
-  if (len < sizeof (type))
+  unsigned type;
+  if (awg_unwrap (&d->awg, buf, &len, &type) < 0)
     return;
-  memcpy (&type, buf, sizeof (type));
-  if (le32toh (type) == MSG_DATA)
+  if (type == AWG_DATA)
     {
       WorkJob j;
       WorkJob *job;
@@ -772,19 +819,22 @@ data_udp (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
       return;
     }
   pthread_rwlock_wrlock (&d->lock);
-  switch (le32toh (type))
+  switch (type)
     {
-    case MSG_INIT:
+    case AWG_INIT:
       if (len == sizeof (MsgInit))
-        init_get (d, src, (const void *)buf);
+        init_get (d, src, (void *)buf);
       break;
-    case MSG_RESP:
+    case AWG_RESP:
       if (len == sizeof (MsgResp))
-        resp_get (d, src, (const void *)buf);
+        resp_get (d, src, (void *)buf);
       break;
-    case MSG_COOKIE:
+    case AWG_COOKIE:
       if (len == sizeof (MsgCookie))
-        cookie_get (d, (const void *)buf);
+        {
+          awg_type_normalize (buf, AWG_COOKIE);
+          cookie_get (d, (const void *)buf);
+        }
       break;
     }
   pthread_rwlock_unlock (&d->lock);
@@ -804,19 +854,24 @@ data_work (WorkJob *j)
   else
     {
       MsgData m = {
-        .type = htole32 (MSG_DATA),
+        .type = 0,
         .recv = htole32 (j->receiver),
         .cnt = htole64 (j->cnt),
       };
       size_t plain = j->len;
-      size_t pad = (plain + 15U) & ~15U;
+      size_t pad = plain + awg_content_pad (&j->dev->awg, plain, 0);
       size_t n;
       memmove (j->buf + sizeof (m), j->buf, plain);
+      awg_type_set (&j->dev->awg, AWG_DATA, &m);
       memcpy (j->buf, &m, sizeof (m));
       memset (j->buf + sizeof (m) + plain, 0, pad - plain);
       j->ok = aead_enc (j->buf + sizeof (m), &n, j->buf + sizeof (m), pad,
                         NULL, 0, j->cnt, j->key);
       j->len = j->ok ? sizeof (m) + n : 0;
+      if (j->ok
+          && awg_wrap (&j->dev->awg, AWG_DATA, j->buf, &j->len,
+                       sizeof (j->buf)) < 0)
+        j->ok = false;
     }
   sodium_memzero (j->key, sizeof (j->key));
 }

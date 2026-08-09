@@ -34,7 +34,7 @@ dev_fnd (Dev *head, const char *name)
 }
 
 static int
-dev_add (Dev **head, int ep, const char *name)
+dev_add (Dev **head, int ep, const char *name, const char *socket_dir)
 {
   struct epoll_event ev = { .events = EPOLLIN | EPOLLERR | EPOLLHUP };
   Dev *d;
@@ -46,6 +46,7 @@ dev_add (Dev **head, int ep, const char *name)
   d = dev_new (name);
   if (!d)
     return -ENOMEM;
+  snprintf (d->socket_dir, sizeof (d->socket_dir), "%s", socket_dir);
   d->tun = tun_open (name);
   if (d->tun < 0)
     goto fail;
@@ -116,10 +117,10 @@ ctl_open (void)
 }
 
 int
-ctl_add (const char *name)
+ctl_add (const char *name, const char *socket_dir)
 {
   struct sockaddr_un sa = { .sun_family = AF_UNIX };
-  char req[IFNAMSIZ + 8], res[32];
+  char req[IFNAMSIZ + 48], res[32];
   int fd = socket (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     return -1;
@@ -131,7 +132,7 @@ ctl_add (const char *name)
       errno = e;
       return -1;
     }
-  int n = snprintf (req, sizeof (req), "add=%s\n", name);
+  int n = snprintf (req, sizeof (req), "add=%s:%s\n", socket_dir, name);
   if (n <= 0 || write (fd, req, (size_t)n) != n)
     {
       close (fd);
@@ -165,7 +166,7 @@ ctl_hnd (int fd, Dev **head, int ep)
 {
   for (;;)
     {
-      char buf[IFNAMSIZ + 8];
+      char buf[IFNAMSIZ + 48];
       int c = accept4 (fd, NULL, NULL, SOCK_CLOEXEC);
       if (c < 0)
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
@@ -178,7 +179,16 @@ ctl_hnd (int fd, Dev **head, int ep)
           if (nl)
             *nl = '\0';
           if (!strncmp (buf, "add=", 4))
-            rc = dev_add (head, ep, buf + 4);
+            {
+              char *name = strrchr (buf + 4, ':');
+              if (name)
+                {
+                  *name++ = '\0';
+                  if (!strcmp (buf + 4, WG_SOCKET_DIR)
+                      || !strcmp (buf + 4, AWG_SOCKET_DIR))
+                    rc = dev_add (head, ep, name, buf + 4);
+                }
+            }
         }
       reply (c, rc);
       close (c);
@@ -189,6 +199,8 @@ void
 ctl_close (int fd)
 {
   if (fd >= 0)
-    close (fd);
-  unlink (CTL_PATH);
+    {
+      close (fd);
+      unlink (CTL_PATH);
+    }
 }

@@ -4,9 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifndef SOCKET_DIR
-#define SOCKET_DIR "/var/run/wireguard"
-#endif
+#define WG_SOCKET_DIR "/var/run/wireguard"
+#define AWG_SOCKET_DIR "/var/run/amneziawg"
 
 #define KEY_LEN 32U
 #define HEX_LEN 64U

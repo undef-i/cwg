@@ -8,7 +8,7 @@
 typedef struct Ep Ep;
 
 #define UDP_BATCH_MAX 32U
-#define UDP_PACKET_MAX 2048U
+#define UDP_PACKET_MAX 4096U
 
 struct Ep
 {

@@ -81,6 +81,7 @@ dev_new (const char *name)
   d->uapi = -1;
   d->udp4 = -1;
   d->udp6 = -1;
+  awg_init (&d->awg);
   if (pthread_rwlock_init (&d->lock, NULL)
       || pthread_mutex_init (&d->data_lock, NULL))
     {

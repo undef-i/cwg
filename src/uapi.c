@@ -1,4 +1,5 @@
 #include "uapi.h"
+#include "awg.h"
 #include "data.h"
 #include "utils.h"
 #include "work.h"
@@ -59,7 +60,7 @@ aip_set (Dev *d, Peer *p, const char *val)
 }
 
 static int
-dev_set (Dev *d, const char *key, const char *val)
+dev_set (Dev *d, Awg *awg, const char *key, const char *val)
 {
   uint8_t sk[KEY_LEN];
   uint64_t n;
@@ -88,7 +89,11 @@ dev_set (Dev *d, const char *key, const char *val)
   else if (!strcmp (key, "replace_peers") && !strcmp (val, "true"))
     dev_peer_clr (d);
   else
-    return -EINVAL;
+    {
+      int rc = awg_set (awg, key, val);
+      if (rc == -ENOENT || rc < 0)
+        return -EINVAL;
+    }
   return 0;
 }
 
@@ -167,6 +172,7 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
 static int
 set_run (Dev *d, FILE *f)
 {
+  Awg awg = d->awg;
   SetPeer sp = { 0 };
   char *line = NULL;
   size_t cap = 0;
@@ -205,12 +211,16 @@ set_run (Dev *d, FILE *f)
             }
         }
       else if (!sp.p && !sp.dummy)
-        rc = dev_set (d, line, val);
+        rc = dev_set (d, &awg, line, val);
       else
         rc = peer_set (d, &sp, line, val);
       if (rc)
         break;
     }
+  if (!rc && awg_validate (&awg) < 0)
+    rc = -EINVAL;
+  if (!rc)
+    d->awg = awg;
   free (line);
   return rc;
 }
@@ -229,6 +239,35 @@ get_run (Dev *d, FILE *f)
     fprintf (f, "listen_port=%u\n", d->port);
   if (d->mark)
     fprintf (f, "fwmark=%u\n", d->mark);
+  if (d->awg.jc)
+    fprintf (f, "jc=%u\n", d->awg.jc);
+  if (d->awg.jmin)
+    fprintf (f, "jmin=%u\n", d->awg.jmin);
+  if (d->awg.jmax)
+    fprintf (f, "jmax=%u\n", d->awg.jmax);
+  if (d->awg.content_pad.lo || d->awg.content_pad.hi)
+    {
+      char range[32];
+      fprintf (f, "content_padding_addition=%s\n",
+               awg_range_get (&d->awg.content_pad, range));
+    }
+  for (unsigned i = 0; i < AWG_TYPE_N; i++)
+    {
+      char range[32];
+      if (d->awg.s[i])
+        fprintf (f, "s%u=%u\n", i + 1U, d->awg.s[i]);
+      if (d->awg.h[i].lo || d->awg.h[i].hi)
+        fprintf (f, "h%u=%s\n", i + 1U,
+                 awg_range_get (&d->awg.h[i], range));
+    }
+  if (d->awg.hp)
+    {
+      key_hex (hex, d->awg.hp_key);
+      fprintf (f, "header_protection_key=%s\n", hex);
+    }
+  for (unsigned i = 0; i < 5; i++)
+    if (d->awg.i[i][0])
+      fprintf (f, "i%u=%s\n", i + 1U, d->awg.i[i]);
   HASH_ITER (hh, d->peer, p, tmp)
   {
     key_hex (hex, p->pk);
@@ -297,9 +336,9 @@ uapi_open (Dev *d)
   mode_t old;
   int fd;
 
-  if (mkdir (SOCKET_DIR, 0755) < 0 && errno != EEXIST)
+  if (mkdir (d->socket_dir, 0755) < 0 && errno != EEXIST)
     return -1;
-  snprintf (d->sock, sizeof (d->sock), "%s/%s.sock", SOCKET_DIR, d->name);
+  snprintf (d->sock, sizeof (d->sock), "%s/%s.sock", d->socket_dir, d->name);
   if (strlen (d->sock) >= sizeof (sa.sun_path))
     {
       errno = ENAMETOOLONG;
@@ -337,6 +376,34 @@ uapi_open (Dev *d)
       unlink (d->sock);
       return -1;
     }
+  d->uapi = fd;
+  return 0;
+}
+
+int
+uapi_adopt (Dev *d, int fd)
+{
+  struct sockaddr_un sa = { 0 };
+  socklen_t sa_len = sizeof (sa);
+  socklen_t opt_len = sizeof (int);
+  int flags, type, listening;
+  if (fd < 0 || getsockname (fd, (struct sockaddr *)&sa, &sa_len) < 0
+      || sa.sun_family != AF_UNIX
+      || getsockopt (fd, SOL_SOCKET, SO_TYPE, &type, &opt_len) < 0
+      || type != SOCK_STREAM
+      || getsockopt (fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &opt_len) < 0
+      || !listening || !sa.sun_path[0]
+      || (flags = fcntl (fd, F_GETFL)) < 0
+      || fcntl (fd, F_SETFL, flags | O_NONBLOCK) < 0
+      || (flags = fcntl (fd, F_GETFD)) < 0
+      || fcntl (fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+    return -1;
+  snprintf (d->sock, sizeof (d->sock), "%s", sa.sun_path);
+  char expected[sizeof (d->sock)];
+  snprintf (expected, sizeof (expected), "%s/%s.sock", d->socket_dir,
+            d->name);
+  if (strcmp (d->sock, expected))
+    return -1;
   d->uapi = fd;
   return 0;
 }
