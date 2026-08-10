@@ -167,7 +167,8 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
         return -EINVAL;
       if (ep_get (&sp->p->addr, val) < 0)
         return -EINVAL;
-      strcpy (sp->p->ep, val);
+      if (ep_fmt (&sp->p->addr, sp->p->ep, sizeof (sp->p->ep)) < 0)
+        return -EINVAL;
     }
   else if (!strcmp (key, "persistent_keepalive_interval"))
     {

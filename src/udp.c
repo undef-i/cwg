@@ -2,6 +2,9 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
+#include <netinet/ip.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -27,7 +30,7 @@ ep_get (Ep *ep, const char *s)
 {
   struct sockaddr_in sa4 = { .sin_family = AF_INET };
   struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6 };
-  char host[INET6_ADDRSTRLEN];
+  char host[INET6_ADDRSTRLEN + IFNAMSIZ + 2U];
   const char *p;
   size_t n;
   uint16_t port;
@@ -47,6 +50,13 @@ ep_get (Ep *ep, const char *s)
         goto bad;
       memcpy (host, s + 1, n);
       host[n] = '\0';
+      char *zone = strchr (host, '%');
+      if (zone)
+        {
+          *zone++ = '\0';
+          if (!*zone || !(sa6.sin6_scope_id = if_nametoindex (zone)))
+            goto bad;
+        }
       if (inet_pton (AF_INET6, host, &sa6.sin6_addr) != 1)
         goto bad;
       sa6.sin6_port = htons (port);
@@ -76,6 +86,40 @@ bad:
   return -1;
 }
 
+int
+ep_fmt (const Ep *ep, char *buf, size_t cap)
+{
+  char ip[INET6_ADDRSTRLEN];
+  uint16_t port;
+  if (ep->sa.ss_family == AF_INET)
+    {
+      const struct sockaddr_in *sa = (const void *)&ep->sa;
+      if (!inet_ntop (AF_INET, &sa->sin_addr, ip, sizeof (ip)))
+        return -1;
+      port = ntohs (sa->sin_port);
+      return snprintf (buf, cap, "%s:%u", ip, port) < (int)cap ? 0 : -1;
+    }
+  if (ep->sa.ss_family == AF_INET6)
+    {
+      const struct sockaddr_in6 *sa = (const void *)&ep->sa;
+      if (!inet_ntop (AF_INET6, &sa->sin6_addr, ip, sizeof (ip)))
+        return -1;
+      port = ntohs (sa->sin6_port);
+      if (sa->sin6_scope_id)
+        {
+          char zone[IFNAMSIZ];
+          if (if_indextoname (sa->sin6_scope_id, zone))
+            return snprintf (buf, cap, "[%s%%%s]:%u", ip, zone, port)
+                           < (int)cap
+                       ? 0
+                       : -1;
+        }
+      return snprintf (buf, cap, "[%s]:%u", ip, port) < (int)cap ? 0 : -1;
+    }
+  errno = EINVAL;
+  return -1;
+}
+
 static int
 udp_bind (int af, uint16_t port)
 {
@@ -87,6 +131,9 @@ udp_bind (int af, uint16_t port)
       int one = 1;
       if (setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof (one)) < 0)
         goto fail;
+      if (setsockopt (fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof (one))
+          < 0)
+        goto fail;
       struct sockaddr_in6 sa = {
         .sin6_family = AF_INET6,
         .sin6_port = htons (port),
@@ -97,6 +144,9 @@ udp_bind (int af, uint16_t port)
     }
   else
     {
+      int one = 1;
+      if (setsockopt (fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof (one)) < 0)
+        goto fail;
       struct sockaddr_in sa = {
         .sin_family = AF_INET,
         .sin_port = htons (port),
@@ -206,6 +256,14 @@ udp_mark (int udp4, int udp6, uint32_t mark)
 ssize_t
 udp_send (int fd, const Ep *ep, const void *buf, size_t len)
 {
+  struct iovec iov = { .iov_base = (void *)buf, .iov_len = len };
+  struct msghdr msg = {
+    .msg_name = (void *)&ep->sa,
+    .msg_namelen = ep->len,
+    .msg_iov = &iov,
+    .msg_iovlen = 1,
+  };
+  uint8_t control[CMSG_SPACE (sizeof (struct in6_pktinfo))] = { 0 };
   ssize_t n;
 
   if (!ep || (ep->sa.ss_family != AF_INET && ep->sa.ss_family != AF_INET6))
@@ -213,8 +271,37 @@ udp_send (int fd, const Ep *ep, const void *buf, size_t len)
       errno = EINVAL;
       return -1;
     }
+  if (ep->src_len)
+    {
+      struct cmsghdr *cmsg;
+      msg.msg_control = control;
+      if (ep->src.ss_family == AF_INET)
+        {
+          struct in_pktinfo *info;
+          msg.msg_controllen = CMSG_SPACE (sizeof (*info));
+          cmsg = CMSG_FIRSTHDR (&msg);
+          cmsg->cmsg_level = IPPROTO_IP;
+          cmsg->cmsg_type = IP_PKTINFO;
+          cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+          info = (void *)CMSG_DATA (cmsg);
+          info->ipi_ifindex = (int)ep->ifindex;
+          info->ipi_spec_dst = ((const struct sockaddr_in *)&ep->src)->sin_addr;
+        }
+      else if (ep->src.ss_family == AF_INET6)
+        {
+          struct in6_pktinfo *info;
+          msg.msg_controllen = CMSG_SPACE (sizeof (*info));
+          cmsg = CMSG_FIRSTHDR (&msg);
+          cmsg->cmsg_level = IPPROTO_IPV6;
+          cmsg->cmsg_type = IPV6_PKTINFO;
+          cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+          info = (void *)CMSG_DATA (cmsg);
+          info->ipi6_ifindex = ep->ifindex;
+          info->ipi6_addr = ((const struct sockaddr_in6 *)&ep->src)->sin6_addr;
+        }
+    }
   do
-    n = sendto (fd, buf, len, 0, (const struct sockaddr *)&ep->sa, ep->len);
+    n = sendmsg (fd, &msg, 0);
   while (n < 0 && errno == EINTR);
   return n;
 }
@@ -252,6 +339,7 @@ udp_recv_batch (int fd, UdpPacket *pkt, unsigned cap)
   struct mmsghdr msg[UDP_BATCH_MAX];
   struct iovec iov[UDP_BATCH_MAX];
   struct sockaddr_storage sa[UDP_BATCH_MAX];
+  uint8_t control[UDP_BATCH_MAX][CMSG_SPACE (sizeof (struct in6_pktinfo))];
   int n;
   if (!pkt || !cap || cap > UDP_BATCH_MAX)
     {
@@ -267,6 +355,8 @@ udp_recv_batch (int fd, UdpPacket *pkt, unsigned cap)
       msg[i].msg_hdr.msg_namelen = sizeof (sa[i]);
       msg[i].msg_hdr.msg_iov = &iov[i];
       msg[i].msg_hdr.msg_iovlen = 1;
+      msg[i].msg_hdr.msg_control = control[i];
+      msg[i].msg_hdr.msg_controllen = sizeof (control[i]);
     }
   do
     n = recvmmsg (fd, msg, cap, MSG_DONTWAIT, NULL);
@@ -276,6 +366,30 @@ udp_recv_batch (int fd, UdpPacket *pkt, unsigned cap)
       memset (&pkt[i].ep, 0, sizeof (pkt[i].ep));
       memcpy (&pkt[i].ep.sa, &sa[i], msg[i].msg_hdr.msg_namelen);
       pkt[i].ep.len = msg[i].msg_hdr.msg_namelen;
+      for (struct cmsghdr *cmsg = CMSG_FIRSTHDR (&msg[i].msg_hdr); cmsg;
+           cmsg = CMSG_NXTHDR (&msg[i].msg_hdr, cmsg))
+        {
+          if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO)
+            {
+              const struct in_pktinfo *info = (const void *)CMSG_DATA (cmsg);
+              struct sockaddr_in *src = (void *)&pkt[i].ep.src;
+              src->sin_family = AF_INET;
+              src->sin_addr = info->ipi_addr;
+              pkt[i].ep.src_len = sizeof (*src);
+              pkt[i].ep.ifindex = (uint32_t)info->ipi_ifindex;
+            }
+          else if (cmsg->cmsg_level == IPPROTO_IPV6
+                   && cmsg->cmsg_type == IPV6_PKTINFO)
+            {
+              const struct in6_pktinfo *info = (const void *)CMSG_DATA (cmsg);
+              struct sockaddr_in6 *src = (void *)&pkt[i].ep.src;
+              src->sin6_family = AF_INET6;
+              src->sin6_addr = info->ipi6_addr;
+              src->sin6_scope_id = info->ipi6_ifindex;
+              pkt[i].ep.src_len = sizeof (*src);
+              pkt[i].ep.ifindex = info->ipi6_ifindex;
+            }
+        }
       pkt[i].len = (msg[i].msg_hdr.msg_flags & MSG_TRUNC) ? 0 : msg[i].msg_len;
     }
   return n;

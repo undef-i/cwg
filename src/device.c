@@ -64,8 +64,10 @@ dev_peer_reset (Dev *d, Peer *p)
   p->ka_due = 0;
   p->pka_due = 0;
   p->hs_due = 0;
+  p->zero_due = 0;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->hs_last_sent = 0;
   p->last_init_ms = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
@@ -241,6 +243,12 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
   d->port = actual;
   d->bind_port = actual;
   d->mark = mark;
+  Peer *p, *tmp;
+  HASH_ITER (hh, d->peer, p, tmp)
+    {
+      p->addr.src_len = 0;
+      p->addr.ifindex = 0;
+    }
   d->udp_gen++;
   return 0;
 }

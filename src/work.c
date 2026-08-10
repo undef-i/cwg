@@ -162,15 +162,7 @@ work_reserve (unsigned type)
   if (!g.nthread || type > WORK_IN)
     return NULL;
   pthread_mutex_lock (&g.lock);
-  while (!g.free_n[type] && !g.stopping)
-    {
-      pthread_mutex_unlock (&g.lock);
-      work_hnd ();
-      pthread_mutex_lock (&g.lock);
-      if (!g.free_n[type] && !g.stopping)
-        pthread_cond_wait (&g.space, &g.lock);
-    }
-  if (g.stopping)
+  if (g.stopping || !g.free_n[type])
     {
       pthread_mutex_unlock (&g.lock);
       return NULL;

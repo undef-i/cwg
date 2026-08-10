@@ -14,6 +14,9 @@ struct Ep
 {
   struct sockaddr_storage sa;
   socklen_t len;
+  struct sockaddr_storage src;
+  socklen_t src_len;
+  uint32_t ifindex;
 };
 
 typedef struct
@@ -24,6 +27,7 @@ typedef struct
 } UdpPacket;
 
 int ep_get (Ep *ep, const char *s);
+int ep_fmt (const Ep *ep, char *buf, size_t cap);
 int udp_open (int *udp4, int *udp6, uint16_t *port);
 void udp_close (int udp4, int udp6);
 int udp_mark (int udp4, int udp6, uint32_t mark);

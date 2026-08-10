@@ -23,7 +23,7 @@
 #define TUNGETIFF _IOR ('T', 210, unsigned int)
 #endif
 
-enum { DEFAULT_MTU = 1420 };
+enum { DEFAULT_MTU = 1420, MAX_CONTENT_MTU = PKT_MAX - 32U };
 
 int
 tun_open (const char *name)
@@ -69,7 +69,7 @@ tun_mtu (const char *name)
   if (ioctl (fd, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0)
     mtu = ifr.ifr_mtu;
   close (fd);
-  return mtu;
+  return mtu > MAX_CONTENT_MTU ? MAX_CONTENT_MTU : mtu;
 }
 
 bool

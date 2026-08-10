@@ -148,9 +148,9 @@ main (int argc, char **argv)
     }
   inherited = has_tun_fd || has_uapi_fd;
 
-  if (has_tun_fd != has_uapi_fd || (inherited && tun_fd == uapi_fd))
+  if (has_tun_fd > 0 && has_uapi_fd > 0 && tun_fd == uapi_fd)
     {
-      err ("WG_TUN_FD and WG_UAPI_FD must be distinct and set together");
+      err ("WG_TUN_FD and WG_UAPI_FD must be distinct");
       return 1;
     }
 
@@ -168,14 +168,14 @@ main (int argc, char **argv)
   if (!d)
     return 1;
   snprintf (d->socket_dir, sizeof (d->socket_dir), "%s", socket_dir);
-  d->tun = inherited ? tun_adopt (tun_fd, name) : tun_open (name);
+  d->tun = has_tun_fd > 0 ? tun_adopt (tun_fd, name) : tun_open (name);
   if (d->tun < 0)
     {
       err ("%s: tun: %s", name, strerror (errno));
       goto out;
     }
   d->mtu = tun_mtu (name);
-  if ((inherited ? uapi_adopt (d, uapi_fd) : uapi_open (d)) < 0)
+  if ((has_uapi_fd > 0 ? uapi_adopt (d, uapi_fd) : uapi_open (d)) < 0)
     {
       err ("%s: uapi: %s", name, strerror (errno));
       goto out;

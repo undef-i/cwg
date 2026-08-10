@@ -57,10 +57,10 @@ typedef struct
 
 struct HsRate
 {
-  Ep ep;
+  uint8_t key[17];
   uint64_t last;
   uint64_t tokens;
-  HsRate *next;
+  UT_hash_handle hh;
 };
 
 struct Peer
@@ -79,8 +79,10 @@ struct Peer
   atomic_uint_fast64_t ka_due;
   atomic_uint_fast64_t pka_due;
   atomic_uint_fast64_t hs_due;
+  atomic_uint_fast64_t zero_due;
   uint64_t hs_start;
   uint64_t hs_next;
+  uint64_t hs_last_sent;
   uint64_t last_init_ms;
   uint32_t hs_attempts;
   uint32_t hs_max_attempts;

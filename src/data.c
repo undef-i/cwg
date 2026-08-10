@@ -8,6 +8,8 @@
 
 #include <arpa/inet.h>
 #include <endian.h>
+#include <errno.h>
+#include <net/if.h>
 #include <sodium.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -150,26 +152,9 @@ awg_handshake_preamble (Dev *d, Peer *p)
 static void
 roam (Peer *p, const Ep *ep)
 {
-  char ip[INET6_ADDRSTRLEN];
-  const void *src;
-  uint16_t port;
   p->addr = *ep;
-  if (ep->sa.ss_family == AF_INET)
-    {
-      const struct sockaddr_in *sa = (const void *)&ep->sa;
-      src = &sa->sin_addr;
-      port = ntohs (sa->sin_port);
-      if (inet_ntop (AF_INET, src, ip, sizeof (ip)))
-        snprintf (p->ep, sizeof (p->ep), "%s:%u", ip, port);
-    }
-  else if (ep->sa.ss_family == AF_INET6)
-    {
-      const struct sockaddr_in6 *sa = (const void *)&ep->sa;
-      src = &sa->sin6_addr;
-      port = ntohs (sa->sin6_port);
-      if (inet_ntop (AF_INET6, src, ip, sizeof (ip)))
-        snprintf (p->ep, sizeof (p->ep), "[%s]:%u", ip, port);
-    }
+  if (ep_fmt (ep, p->ep, sizeof (p->ep)) < 0)
+    p->ep[0] = '\0';
 }
 
 static uint64_t
@@ -203,18 +188,22 @@ hs_under_load (Dev *d, uint64_t now)
 }
 
 static bool
-ep_same_ip (const Ep *a, const Ep *b)
+hs_rate_key (uint8_t key[17], const Ep *ep)
 {
-  if (a->sa.ss_family != b->sa.ss_family)
-    return false;
-  if (a->sa.ss_family == AF_INET)
-    return !memcmp (&((const struct sockaddr_in *)&a->sa)->sin_addr,
-                    &((const struct sockaddr_in *)&b->sa)->sin_addr,
-                    sizeof (struct in_addr));
-  if (a->sa.ss_family == AF_INET6)
-    return !memcmp (&((const struct sockaddr_in6 *)&a->sa)->sin6_addr,
-                    &((const struct sockaddr_in6 *)&b->sa)->sin6_addr,
-                    sizeof (struct in6_addr));
+  memset (key, 0, 17);
+  if (ep->sa.ss_family == AF_INET)
+    {
+      key[0] = AF_INET;
+      memcpy (key + 1, &((const struct sockaddr_in *)&ep->sa)->sin_addr, 4);
+      return true;
+    }
+  if (ep->sa.ss_family == AF_INET6)
+    {
+      key[0] = AF_INET6;
+      memcpy (key + 1, &((const struct sockaddr_in6 *)&ep->sa)->sin6_addr,
+              16);
+      return true;
+    }
   return false;
 }
 
@@ -222,30 +211,20 @@ static bool
 hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
 {
   enum { RATE_MS = 1000U / 20U, BURST_MS = RATE_MS * 5U };
-  HsRate **pp = &d->hs_rate;
   HsRate *rate;
-  while ((rate = *pp))
-    {
-      if (now - rate->last > 1000U)
-        {
-          *pp = rate->next;
-          free (rate);
-          continue;
-        }
-      if (ep_same_ip (&rate->ep, ep))
-        break;
-      pp = &rate->next;
-    }
+  uint8_t key[17];
+  if (!hs_rate_key (key, ep))
+    return false;
+  HASH_FIND (hh, d->hs_rate, key, sizeof (key), rate);
   if (!rate)
     {
       rate = calloc (1, sizeof (*rate));
       if (!rate)
         return false;
-      rate->ep = *ep;
+      memcpy (rate->key, key, sizeof (key));
       rate->last = now;
       rate->tokens = BURST_MS - RATE_MS;
-      rate->next = d->hs_rate;
-      d->hs_rate = rate;
+      HASH_ADD (hh, d->hs_rate, key, sizeof (rate->key), rate);
       return true;
     }
   rate->tokens += now - rate->last;
@@ -258,6 +237,18 @@ hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
       return true;
     }
   return false;
+}
+
+static void
+hs_rate_prune (Dev *d, uint64_t now)
+{
+  HsRate *rate, *tmp;
+  HASH_ITER (hh, d->hs_rate, rate, tmp)
+    if (now - rate->last > 1000U)
+      {
+        HASH_DEL (d->hs_rate, rate);
+        free (rate);
+      }
 }
 
 static bool
@@ -381,6 +372,9 @@ kp_set (Dev *d, Peer *p, bool initiator)
   e->ptr = dst;
   e->type = IDX_KP;
   p->hs.li = 0;
+  atomic_store_explicit (&p->zero_due,
+                         k.born + awg_ms (&d->awg.reject_after, REJECT_MS) * 3U,
+                         memory_order_relaxed);
   return true;
 }
 
@@ -393,6 +387,29 @@ kp_live (const Dev *d, const Kp *k, uint64_t now)
 }
 
 static void init_send (Dev *, Peer *, bool);
+static void purge (Peer *);
+
+static void
+key_clear (Dev *d, Peer *p)
+{
+  uint8_t last[sizeof (p->hs.last)];
+  memcpy (last, p->hs.last, sizeof (last));
+  if (p->hs.li)
+    idx_del (&d->idx, p->hs.li);
+  kp_drop (d, &p->kp);
+  kp_drop (d, &p->prev);
+  kp_drop (d, &p->pending);
+  noise_init (&p->hs, d->sk, p->pk, p->psk);
+  memcpy (p->hs.last, last, sizeof (last));
+  sodium_memzero (last, sizeof (last));
+  p->hs_pending = false;
+  p->hs_start = 0;
+  p->hs_next = 0;
+  p->hs_attempts = 0;
+  p->hs_max_attempts = 0;
+  p->rekey_sent = false;
+  purge (p);
+}
 
 static bool
 data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
@@ -556,9 +573,14 @@ init_send (Dev *d, Peer *p, bool retry)
   MsgInit *m = (void *)buf;
   uint8_t last[sizeof (p->hs.last)];
   uint32_t li;
+  uint64_t now = data_now ();
   if (!buf || !d->has_sk || !p->addr.len)
     goto out;
   if (p->hs_pending && !retry)
+    goto out;
+  if (p->hs_last_sent
+      && now - p->hs_last_sent
+             < awg_lo_ms (&d->awg.rekey_timeout, RETRY_MS))
     goto out;
   if (p->hs.li)
     idx_del (&d->idx, p->hs.li);
@@ -579,7 +601,7 @@ init_send (Dev *d, Peer *p, bool retry)
   awg_handshake_preamble (d, p);
   if (awg_wrap (&d->awg, AWG_INIT, buf, &len, cap) == 0)
     send_pkt (d, p, buf, len, true);
-  uint64_t now = data_now ();
+  p->hs_last_sent = now;
   if (!p->hs_pending)
     {
       p->hs_start = now;
@@ -606,7 +628,6 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
   Peer *p;
   WorkJob j;
   WorkJob *job;
-  bool reserved;
   if (len >= 20 && (buf[0] >> 4) == 4)
     af = AF_INET, dst = buf + 16;
   else if (len >= 40 && (buf[0] >> 4) == 6)
@@ -623,7 +644,6 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
       return;
     }
   job = work_reserve (WORK_OUT);
-  reserved = job != NULL;
   if (job && out_job (d, p, buf, len, job))
     {
       job->owner = p;
@@ -631,14 +651,9 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
       work_submit (job);
       pthread_rwlock_unlock (&d->lock);
       return;
-    }
+  }
   work_release (job, WORK_OUT);
-  if (!reserved && work_count ())
-    {
-      pthread_rwlock_unlock (&d->lock);
-      return;
-    }
-  if (!work_count () && out_job (d, p, buf, len, &j))
+  if (out_job (d, p, buf, len, &j))
     {
       data_work (&j);
       data_commit (&j);
@@ -878,7 +893,8 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
     return;
   if (iplen > n || aip_fnd (d, af, sip) != p)
     return;
-  tun_write (d->tun, plain, iplen);
+  if (tun_write (d->tun, plain, iplen) != (ssize_t)iplen)
+    err ("(%s) tun write: %s", d->name, strerror (errno));
 }
 
 void
@@ -895,6 +911,7 @@ void
 data_tick (Dev *d, uint64_t now)
 {
   Peer *p, *tmp;
+  hs_rate_prune (d, now);
   HASH_ITER (hh, d->peer, p, tmp)
   {
     uint64_t reject = awg_hi_ms (&d->awg.reject_after, REJECT_MS);
@@ -920,6 +937,11 @@ data_tick (Dev *d, uint64_t now)
         memcpy (p->hs.last, last, sizeof (last));
         sodium_memzero (last, sizeof (last));
         purge (p);
+        if (!atomic_load_explicit (&p->zero_due, memory_order_relaxed))
+          atomic_store_explicit (
+              &p->zero_due,
+              now + awg_ms (&d->awg.reject_after, REJECT_MS) * 3U,
+              memory_order_relaxed);
       }
     else if (p->hs_pending && now >= p->hs_next)
       {
@@ -957,6 +979,12 @@ data_tick (Dev *d, uint64_t now)
         atomic_store_explicit (&p->pka_due, 0, memory_order_relaxed);
         data_keepalive (d, p);
       }
+    uint64_t zero = atomic_load_explicit (&p->zero_due, memory_order_relaxed);
+    if (zero && now >= zero)
+      {
+        atomic_store_explicit (&p->zero_due, 0, memory_order_relaxed);
+        key_clear (d, p);
+      }
   }
 }
 
@@ -983,8 +1011,6 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
           return;
         }
       job = work_reserve (WORK_IN);
-      if (!job && work_count ())
-        return;
       if (!job)
         job = &j;
       memset (job, 0, offsetof (WorkJob, buf));
@@ -1119,12 +1145,7 @@ data_hs_free (Dev *d)
   pthread_cond_signal (&d->hs_ready);
   pthread_mutex_unlock (&d->hs_lock);
   pthread_join (d->hs_thread, NULL);
-  while (d->hs_rate)
-    {
-      HsRate *next = d->hs_rate->next;
-      free (d->hs_rate);
-      d->hs_rate = next;
-    }
+  hs_rate_prune (d, UINT64_MAX);
 }
 
 void
@@ -1261,7 +1282,8 @@ data_commit (WorkJob *j)
       if (iplen <= j->len && aip_fnd (d, af, sip) == p)
         {
           pka_arm (p, now);
-          tun_write (d->tun, j->buf, iplen);
+          if (tun_write (d->tun, j->buf, iplen) != (ssize_t)iplen)
+            err ("(%s) tun write: %s", d->name, strerror (errno));
         }
     }
 out:
