@@ -120,6 +120,7 @@ int
 udp_open (int *udp4, int *udp6, uint16_t *port)
 {
   uint16_t want;
+  int e4, e6;
 
   if (!udp4 || !udp6 || !port)
     {
@@ -135,20 +136,39 @@ udp_open (int *udp4, int *udp6, uint16_t *port)
       socklen_t len = sizeof (sa);
 
       *udp4 = udp_bind (AF_INET, want);
-      if (*udp4 < 0)
-        return -1;
-      if (getsockname (*udp4, (struct sockaddr *)&sa, &len) < 0)
-        goto fail;
-      *udp6 = udp_bind (AF_INET6, ntohs (sa.sin_port));
-      if (*udp6 >= 0)
+      e4 = errno;
+      if (*udp4 >= 0)
         {
-          *port = ntohs (sa.sin_port);
+          if (getsockname (*udp4, (struct sockaddr *)&sa, &len) < 0)
+            goto fail;
+          *udp6 = udp_bind (AF_INET6, ntohs (sa.sin_port));
+          e6 = errno;
+          if (*udp6 >= 0 || e6 == EAFNOSUPPORT)
+            {
+              *port = ntohs (sa.sin_port);
+              return 0;
+            }
+          if (!want && e6 == EADDRINUSE)
+            {
+              close (*udp4);
+              *udp4 = -1;
+              continue;
+            }
+          goto fail;
+        }
+      *udp6 = udp_bind (AF_INET6, want);
+      e6 = errno;
+      if (*udp6 >= 0 && e4 == EAFNOSUPPORT)
+        {
+          struct sockaddr_in6 sa6;
+          socklen_t len6 = sizeof (sa6);
+          if (getsockname (*udp6, (struct sockaddr *)&sa6, &len6) < 0)
+            goto fail;
+          *port = ntohs (sa6.sin6_port);
           return 0;
         }
-      if (want || errno != EADDRINUSE)
-        goto fail;
-      close (*udp4);
-      *udp4 = -1;
+      errno = e4 != EAFNOSUPPORT ? e4 : e6;
+      goto fail;
     }
 
 fail:
@@ -174,9 +194,13 @@ udp_close (int udp4, int udp6)
 int
 udp_mark (int udp4, int udp6, uint32_t mark)
 {
-  if (setsockopt (udp4, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) < 0)
+  if (udp4 >= 0
+      && setsockopt (udp4, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) < 0)
     return -1;
-  return setsockopt (udp6, SOL_SOCKET, SO_MARK, &mark, sizeof (mark));
+  return udp6 < 0
+         || setsockopt (udp6, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) == 0
+             ? 0
+             : -1;
 }
 
 ssize_t

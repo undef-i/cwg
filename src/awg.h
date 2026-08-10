@@ -33,10 +33,11 @@ typedef struct
   AwgRange max_handshake_attempts;
   uint8_t hp_key[KEY_LEN];
   bool hp;
-  char i[5][AWG_PACKET_MAX + 1U];
+  char *i[5];
 } Awg;
 
 void awg_init (Awg *a);
+void awg_free (Awg *a);
 int awg_range_set (AwgRange *r, const char *value);
 int awg_hex_set (uint8_t *out, size_t *out_len, const char *value);
 int awg_set (Awg *a, const char *key, const char *value);

@@ -208,7 +208,6 @@ work_submit (WorkJob *j)
     return;
   idx = (unsigned)(j - g.slot);
   pthread_mutex_lock (&g.lock);
-  j->seq = j->owner->work_submit[j->type]++;
   j->next = NULL;
   if (j->owner->work_tail[j->type])
     j->owner->work_tail[j->type]->next = j;
@@ -264,7 +263,6 @@ work_hnd (void)
           if (!p->work_head[type])
             p->work_tail[type] = NULL;
           g.commit (j);
-          p->work_commit[type]++;
           atomic_fetch_sub_explicit (&p->work_ref, 1, memory_order_release);
           work_release (j, type);
           pthread_mutex_lock (&g.lock);

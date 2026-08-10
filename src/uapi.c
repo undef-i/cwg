@@ -23,7 +23,15 @@ typedef struct
   Peer *p;
   bool dummy;
   bool fresh;
+  bool pka_on;
 } SetPeer;
+
+struct UapiConn
+{
+  Dev *dev;
+  int fd;
+  UapiConn *next;
+};
 
 static int
 aip_set (Dev *d, Peer *p, const char *val)
@@ -98,6 +106,28 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
   return 0;
 }
 
+static bool
+awg_staged (const char *key)
+{
+  return (!strcmp (key, "h1") || !strcmp (key, "h2")
+          || !strcmp (key, "h3") || !strcmp (key, "h4")
+          || !strcmp (key, "s1") || !strcmp (key, "s2")
+          || !strcmp (key, "s3") || !strcmp (key, "s4")
+          || !strcmp (key, "header_protection_key"));
+}
+
+static void
+awg_merge (Awg *dst, const Awg *src)
+{
+  for (unsigned i = 0; i < AWG_TYPE_N; i++)
+    {
+      dst->h[i] = src->h[i];
+      dst->s[i] = src->s[i];
+    }
+  memcpy (dst->hp_key, src->hp_key, sizeof (dst->hp_key));
+  dst->hp = src->hp;
+}
+
 static int
 peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
 {
@@ -130,7 +160,6 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
         return -EINVAL;
       memcpy (sp->p->psk, psk, sizeof (psk));
       sodium_memzero (psk, sizeof (psk));
-      dev_peer_reset (d, sp->p);
     }
   else if (!strcmp (key, "endpoint"))
     {
@@ -139,8 +168,6 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
       if (ep_get (&sp->p->addr, val) < 0)
         return -EINVAL;
       strcpy (sp->p->ep, val);
-      if (sp->p->qn)
-        data_keepalive (d, sp->p);
     }
   else if (!strcmp (key, "persistent_keepalive_interval"))
     {
@@ -149,8 +176,7 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
         return -EINVAL;
       if (!(sp->p->ka.lo || sp->p->ka.hi))
         atomic_store_explicit (&sp->p->pka_due, 0, memory_order_relaxed);
-      if (!(old.lo || old.hi) && (sp->p->ka.lo || sp->p->ka.hi))
-        data_keepalive (d, sp->p);
+      sp->pka_on = !(old.lo || old.hi) && (sp->p->ka.lo || sp->p->ka.hi);
     }
   else if (!strcmp (key, "replace_allowed_ips"))
     {
@@ -170,10 +196,19 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
   return 0;
 }
 
+static void
+peer_done (Dev *d, SetPeer *sp)
+{
+  if (!sp->p || sp->dummy || !d->up)
+    return;
+  if (sp->pka_on || sp->p->qn)
+    data_keepalive (d, sp->p);
+}
+
 static int
 set_run (Dev *d, FILE *f)
 {
-  Awg awg = d->awg;
+  Awg staged = d->awg;
   SetPeer sp = { 0 };
   char *line = NULL;
   size_t cap = 0;
@@ -195,10 +230,12 @@ set_run (Dev *d, FILE *f)
         }
       *eq = '\0';
       val = eq + 1;
-      if (!strcmp (line, "public_key"))
-        {
-          uint8_t pk[KEY_LEN];
-          if (!key_get (pk, val))
+        if (!strcmp (line, "public_key"))
+          {
+            uint8_t pk[KEY_LEN];
+            peer_done (d, &sp);
+            sp = (SetPeer){ 0 };
+            if (!key_get (pk, val))
             {
               rc = -EINVAL;
               break;
@@ -212,16 +249,19 @@ set_run (Dev *d, FILE *f)
             }
         }
       else if (!sp.p && !sp.dummy)
-        rc = dev_set (d, &awg, line, val);
+        rc = dev_set (d, awg_staged (line) ? &staged : &d->awg, line, val);
       else
         rc = peer_set (d, &sp, line, val);
       if (rc)
         break;
     }
-  if (!rc && awg_validate (&awg) < 0)
+  if (!rc && awg_validate (&staged) < 0)
     rc = -EINVAL;
   if (!rc)
-    d->awg = awg;
+    {
+      awg_merge (&d->awg, &staged);
+      peer_done (d, &sp);
+    }
   free (line);
   return rc;
 }
@@ -246,6 +286,23 @@ get_run (Dev *d, FILE *f)
     fprintf (f, "jmin=%u\n", d->awg.jmin);
   if (d->awg.jmax)
     fprintf (f, "jmax=%u\n", d->awg.jmax);
+  for (unsigned i = 0; i < AWG_TYPE_N; i++)
+    {
+      char range[32];
+      if (d->awg.s[i])
+        fprintf (f, "s%u=%u\n", i + 1U, d->awg.s[i]);
+      if (d->awg.h[i].lo || d->awg.h[i].hi)
+        fprintf (f, "h%u=%s\n", i + 1U,
+                 awg_range_get (&d->awg.h[i], range));
+    }
+  if (d->awg.hp)
+    {
+      key_hex (hex, d->awg.hp_key);
+      fprintf (f, "header_protection_key=%s\n", hex);
+    }
+  for (unsigned i = 0; i < 5; i++)
+    if (d->awg.i[i])
+      fprintf (f, "i%u=%s\n", i + 1U, d->awg.i[i]);
   if (d->awg.content_pad.lo || d->awg.content_pad.hi)
     {
       char range[32];
@@ -266,23 +323,6 @@ get_run (Dev *d, FILE *f)
         fprintf (f, "%s=%s\n", timings[i].name,
                  awg_range_get (timings[i].range, range));
       }
-  for (unsigned i = 0; i < AWG_TYPE_N; i++)
-    {
-      char range[32];
-      if (d->awg.s[i])
-        fprintf (f, "s%u=%u\n", i + 1U, d->awg.s[i]);
-      if (d->awg.h[i].lo || d->awg.h[i].hi)
-        fprintf (f, "h%u=%s\n", i + 1U,
-                 awg_range_get (&d->awg.h[i], range));
-    }
-  if (d->awg.hp)
-    {
-      key_hex (hex, d->awg.hp_key);
-      fprintf (f, "header_protection_key=%s\n", hex);
-    }
-  for (unsigned i = 0; i < 5; i++)
-    if (d->awg.i[i][0])
-      fprintf (f, "i%u=%s\n", i + 1U, d->awg.i[i]);
   HASH_ITER (hh, d->peer, p, tmp)
   {
     key_hex (hex, p->pk);
@@ -348,11 +388,30 @@ conn_hnd (Dev *d, int fd)
         }
       else
         break;
-      fprintf (f, "errno=%d\n\n", rc < 0 ? -rc : rc);
+      fprintf (f, "errno=%d\n\n", rc);
       fflush (f);
     }
   free (op);
   fclose (f);
+}
+
+static void *
+conn_run (void *arg)
+{
+  UapiConn *conn = arg;
+  Dev *d = conn->dev;
+  conn_hnd (d, conn->fd);
+  pthread_mutex_lock (&d->uapi_lock);
+  UapiConn **pp = &d->uapi_conn;
+  while (*pp != conn)
+    pp = &(*pp)->next;
+  *pp = conn->next;
+  d->uapi_n--;
+  if (!d->uapi_n)
+    pthread_cond_broadcast (&d->uapi_idle);
+  pthread_mutex_unlock (&d->uapi_lock);
+  free (conn);
+  return NULL;
 }
 
 int
@@ -442,12 +501,43 @@ uapi_hnd (Dev *d)
       int fd = accept4 (d->uapi, NULL, NULL, SOCK_CLOEXEC);
       if (fd < 0)
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
-      struct timeval tv = { .tv_sec = 1 };
-      setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
-      setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
-      work_drain ();
-      conn_hnd (d, fd);
+      UapiConn *conn = malloc (sizeof (*conn));
+      if (!conn)
+        {
+          close (fd);
+          continue;
+        }
+      conn->dev = d;
+      conn->fd = fd;
+      pthread_mutex_lock (&d->uapi_lock);
+      conn->next = d->uapi_conn;
+      d->uapi_conn = conn;
+      d->uapi_n++;
+      pthread_mutex_unlock (&d->uapi_lock);
+      pthread_t thread;
+      if (pthread_create (&thread, NULL, conn_run, conn))
+        {
+          pthread_mutex_lock (&d->uapi_lock);
+          d->uapi_conn = conn->next;
+          d->uapi_n--;
+          pthread_mutex_unlock (&d->uapi_lock);
+          close (fd);
+          free (conn);
+          continue;
+        }
+      pthread_detach (thread);
     }
+}
+
+void
+uapi_drain (Dev *d)
+{
+  pthread_mutex_lock (&d->uapi_lock);
+  for (UapiConn *conn = d->uapi_conn; conn; conn = conn->next)
+    shutdown (conn->fd, SHUT_RDWR);
+  while (d->uapi_n)
+    pthread_cond_wait (&d->uapi_idle, &d->uapi_lock);
+  pthread_mutex_unlock (&d->uapi_lock);
 }
 
 void

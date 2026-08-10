@@ -53,7 +53,7 @@ aip_add (Dev *d, Peer *p, int af, const uint8_t ip[16], uint8_t cidr)
   size_t n = af_len (af);
   Aip *a;
 
-  if (!d || !p || !ip || !n || cidr > n * 8U)
+  if (!n || cidr > n * 8U)
     return -EINVAL;
   for (a = d->aip; a; a = a->next)
     if (ip_eq (a, af, ip, cidr))
@@ -78,8 +78,6 @@ aip_del (Dev *d, const Peer *p, int af, const uint8_t ip[16], uint8_t cidr)
 {
   Aip **pp, *a;
 
-  if (!d || !p || !ip)
-    return;
   for (pp = &d->aip; (a = *pp); pp = &a->next)
     if (a->peer == p && ip_eq (a, af, ip, cidr))
       {
@@ -94,8 +92,6 @@ aip_del_peer (Dev *d, const Peer *p)
 {
   Aip **pp, *a;
 
-  if (!d || !p)
-    return;
   pp = &d->aip;
   while ((a = *pp))
     if (a->peer == p)
@@ -112,7 +108,7 @@ aip_fnd (const Dev *d, int af, const uint8_t ip[16])
 {
   const Aip *a, *best = NULL;
 
-  if (!d || !ip || !af_len (af))
+  if (!af_len (af))
     return NULL;
   for (a = d->aip; a; a = a->next)
     if (a->af == af && (!best || a->cidr > best->cidr) && ip_has (a, ip))

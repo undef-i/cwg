@@ -8,7 +8,7 @@ idx_add (Idx **idx, void *ptr, uint8_t type)
 {
   Idx *e, *old;
 
-  if (!idx || !ptr || !(e = malloc (sizeof (*e))))
+  if (!(e = malloc (sizeof (*e))))
     return 0;
   do
     {
@@ -36,7 +36,7 @@ idx_del (Idx **idx, uint32_t index)
 {
   Idx *e;
 
-  if (!idx || !(e = idx_fnd (*idx, index)))
+  if (!(e = idx_fnd (*idx, index)))
     return;
   HASH_DEL (*idx, e);
   free (e);
@@ -47,8 +47,6 @@ idx_clr (Idx **idx)
 {
   Idx *e, *tmp;
 
-  if (!idx)
-    return;
   HASH_ITER (hh, *idx, e, tmp)
   {
     HASH_DEL (*idx, e);

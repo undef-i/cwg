@@ -1,5 +1,6 @@
 #include "device.h"
 #include "data.h"
+#include "uapi.h"
 #include "work.h"
 
 #include <errno.h>
@@ -16,7 +17,6 @@ mono (void)
   clock_gettime (CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec;
 }
-
 static void
 peer_destroy (Peer *p)
 {
@@ -39,8 +39,6 @@ peer_cookie_reset (Peer *p)
 void
 dev_peer_reset (Dev *d, Peer *p)
 {
-  if (!d || !p)
-    return;
   if (p->hs.li)
     idx_del (&d->idx, p->hs.li);
   if (p->kp.li && p->kp.li != p->hs.li)
@@ -68,9 +66,11 @@ dev_peer_reset (Dev *d, Peer *p)
   p->hs_due = 0;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->last_init_ms = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
   p->ka_again = false;
+  p->rekey_sent = false;
   p->hs_pending = false;
   if (d->has_sk)
     noise_init (&p->hs, d->sk, p->pk, p->psk);
@@ -88,9 +88,16 @@ dev_new (const char *name)
   d->udp4 = -1;
   d->udp6 = -1;
   awg_init (&d->awg);
-  if (pthread_rwlock_init (&d->lock, NULL)
-      || pthread_mutex_init (&d->data_lock, NULL))
+  d->hs = calloc (HS_QUEUE_CAP, sizeof (*d->hs));
+  if (!d->hs || pthread_rwlock_init (&d->lock, NULL)
+      || pthread_mutex_init (&d->data_lock, NULL)
+      || pthread_mutex_init (&d->hs_lock, NULL)
+      || pthread_cond_init (&d->hs_ready, NULL)
+      || pthread_cond_init (&d->hs_idle, NULL)
+      || pthread_mutex_init (&d->uapi_lock, NULL)
+      || pthread_cond_init (&d->uapi_idle, NULL) || data_hs_start (d) < 0)
     {
+      free (d->hs);
       free (d);
       return NULL;
     }
@@ -102,8 +109,6 @@ dev_new (const char *name)
 void
 dev_peer_del (Dev *d, Peer *p)
 {
-  if (!d || !p)
-    return;
   aip_del_peer (d, p);
   HASH_DEL (d->peer, p);
   dev_peer_reset (d, p);
@@ -139,13 +144,20 @@ dev_peer_clr (Dev *d)
 void
 dev_free (Dev *d)
 {
-  if (!d)
-    return;
   work_drain ();
+  data_hs_free (d);
+  uapi_drain (d);
   dev_peer_clr (d);
   dev_reap (d);
   idx_clr (&d->idx);
+  pthread_cond_destroy (&d->hs_idle);
+  pthread_cond_destroy (&d->hs_ready);
+  pthread_mutex_destroy (&d->hs_lock);
+  pthread_cond_destroy (&d->uapi_idle);
+  pthread_mutex_destroy (&d->uapi_lock);
+  free (d->hs);
   udp_close (d->udp4, d->udp6);
+  awg_free (&d->awg);
   pthread_mutex_destroy (&d->data_lock);
   pthread_rwlock_destroy (&d->lock);
   sodium_memzero (d, sizeof (*d));
@@ -200,8 +212,6 @@ dev_key_set (Dev *d, const uint8_t sk[KEY_LEN])
   sodium_memzero (d->cookie_secret, sizeof (d->cookie_secret));
   randombytes_buf (d->cookie_secret, sizeof (d->cookie_secret));
   d->cookie_birth = mono ();
-  d->hs_window = 0;
-  d->hs_count = 0;
   HASH_ITER (hh, d->peer, p, tmp)
   {
     if (d->has_sk && !sodium_memcmp (p->pk, d->pk, KEY_LEN))
@@ -244,6 +254,7 @@ dev_up (Dev *d, bool up)
   if (!up)
     {
       work_drain ();
+      data_hs_drain (d);
       HASH_ITER (hh, d->peer, p, tmp) dev_peer_reset (d, p);
       d->up = false;
       udp_close (d->udp4, d->udp6);

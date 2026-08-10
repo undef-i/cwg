@@ -23,7 +23,10 @@ enum
   RETRY_MS = 5000,
   RETRY_JITTER_MS = 334,
   KEEPALIVE_MS = 10000,
+  HANDSHAKE_INIT_MS = 1000U / 50U,
 };
+
+static const uint64_t rekey_msg_limit = UINT64_C (1) << 60;
 
 static uint64_t
 awg_ms (const AwgRange *r, uint32_t fallback)
@@ -126,7 +129,7 @@ awg_handshake_preamble (Dev *d, Peer *p)
   for (unsigned i = 0; i < 5; i++)
     {
       size_t len;
-      if (d->awg.i[i][0]
+      if (d->awg.i[i]
           && awg_i_make (&d->awg, i, buf, &len, AWG_PACKET_MAX) == 0 && len)
         send_pkt (d, p, buf, len, false);
     }
@@ -190,16 +193,71 @@ mac_add (Peer *p, void *msg, size_t mac_off, size_t mac2_off)
 }
 
 static bool
-hs_load (Dev *d)
+hs_under_load (Dev *d, uint64_t now)
 {
-  uint64_t now = data_now ();
-  if (!d->hs_window || now - d->hs_window >= 1000U)
+  bool busy;
+  pthread_mutex_lock (&d->hs_lock);
+  busy = now < d->hs_busy_until;
+  pthread_mutex_unlock (&d->hs_lock);
+  return busy;
+}
+
+static bool
+ep_same_ip (const Ep *a, const Ep *b)
+{
+  if (a->sa.ss_family != b->sa.ss_family)
+    return false;
+  if (a->sa.ss_family == AF_INET)
+    return !memcmp (&((const struct sockaddr_in *)&a->sa)->sin_addr,
+                    &((const struct sockaddr_in *)&b->sa)->sin_addr,
+                    sizeof (struct in_addr));
+  if (a->sa.ss_family == AF_INET6)
+    return !memcmp (&((const struct sockaddr_in6 *)&a->sa)->sin6_addr,
+                    &((const struct sockaddr_in6 *)&b->sa)->sin6_addr,
+                    sizeof (struct in6_addr));
+  return false;
+}
+
+static bool
+hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
+{
+  enum { RATE_MS = 1000U / 20U, BURST_MS = RATE_MS * 5U };
+  HsRate **pp = &d->hs_rate;
+  HsRate *rate;
+  while ((rate = *pp))
     {
-      d->hs_window = now;
-      d->hs_count = 1;
-      return false;
+      if (now - rate->last > 1000U)
+        {
+          *pp = rate->next;
+          free (rate);
+          continue;
+        }
+      if (ep_same_ip (&rate->ep, ep))
+        break;
+      pp = &rate->next;
     }
-  return ++d->hs_count > 50U;
+  if (!rate)
+    {
+      rate = calloc (1, sizeof (*rate));
+      if (!rate)
+        return false;
+      rate->ep = *ep;
+      rate->last = now;
+      rate->tokens = BURST_MS - RATE_MS;
+      rate->next = d->hs_rate;
+      d->hs_rate = rate;
+      return true;
+    }
+  rate->tokens += now - rate->last;
+  rate->last = now;
+  if (rate->tokens > BURST_MS)
+    rate->tokens = BURST_MS;
+  if (rate->tokens > RATE_MS)
+    {
+      rate->tokens -= RATE_MS;
+      return true;
+    }
+  return false;
 }
 
 static bool
@@ -216,54 +274,50 @@ cookie_make (Dev *d, const Ep *src, uint8_t out[COOKIE_LEN])
 
 static bool
 mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
-        size_t mac2_off, uint32_t sender)
+        size_t mac2_off, uint32_t sender, uint64_t now)
 {
-  size_t cap = sizeof (MsgCookie) + d->awg.s[AWG_COOKIE];
-  uint8_t *out = malloc (cap);
-  MsgCookie *r = (void *)out;
+  size_t cap;
+  uint8_t *out;
+  MsgCookie *r;
   uint8_t cookie[COOKIE_LEN];
   int fd;
-  if (!out || !d->has_sk
-      || !cookie_mac1_check ((const uint8_t *)msg + mac_off, d->mac1_key, msg,
-                              mac_off))
-    goto out;
-  if (!hs_load (d))
-    {
-      free (out);
-      return true;
-    }
+  if (!d->has_sk
+       || !cookie_mac1_check ((const uint8_t *)msg + mac_off, d->mac1_key, msg,
+                               mac_off))
+    return false;
+  if (!hs_under_load (d, now))
+    return true;
   if (!cookie_make (d, src, cookie))
-    goto out;
+    return false;
   if (cookie_mac2_check ((const uint8_t *)msg + mac2_off, cookie, msg,
                          mac2_off))
     {
       sodium_memzero (cookie, sizeof (cookie));
-      free (out);
-      return true;
+      return hs_rate_ok (d, src, now);
     }
+  cap = sizeof (MsgCookie) + d->awg.s[AWG_COOKIE];
+  out = malloc (cap);
+  if (!out)
+    goto out;
+  r = (void *)out;
   awg_type_set (&d->awg, AWG_COOKIE, r);
   r->recv = sender;
   randombytes_buf (r->nonce, sizeof (r->nonce));
-  if (!cookie_reply_encrypt (r->cookie, cookie, (const uint8_t *)msg + mac_off,
-                             r->nonce, d->cookie_key))
+  if (cookie_reply_encrypt (r->cookie, cookie, (const uint8_t *)msg + mac_off,
+                            r->nonce, d->cookie_key))
     {
-      sodium_memzero (cookie, sizeof (cookie));
-      goto out;
+      fd = sock (d, src);
+      if (fd >= 0)
+        {
+          size_t len = sizeof (*r);
+          if (awg_wrap (&d->awg, AWG_COOKIE, out, &len, cap) == 0)
+            udp_send (fd, src, out, len);
+        }
     }
-  fd = sock (d, src);
-  if (fd >= 0)
-    {
-      size_t len = sizeof (*r);
-      if (awg_wrap (&d->awg, AWG_COOKIE, out, &len, cap) == 0)
-        udp_send (fd, src, out, len);
-    }
+  sodium_memzero (out, cap);
+  free (out);
 out:
   sodium_memzero (cookie, sizeof (cookie));
-  if (out)
-    {
-      sodium_memzero (out, cap);
-      free (out);
-    }
   return false;
 }
 
@@ -338,6 +392,8 @@ kp_live (const Dev *d, const Kp *k, uint64_t now)
                 < REPLAY_LIMIT;
 }
 
+static void init_send (Dev *, Peer *, bool);
+
 static bool
 data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
 {
@@ -401,10 +457,14 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
   uint64_t now = data_now ();
   atomic_store_explicit (&p->last_tx, now, memory_order_relaxed);
   atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
-  if (len)
-    atomic_store_explicit (&p->hs_due, now + new_handshake_ms (d),
+  if (len && !atomic_load_explicit (&p->hs_due, memory_order_relaxed))
+    atomic_store_explicit (&p->hs_due,
+                           now + new_handshake_ms (d)
+                               + randombytes_uniform (RETRY_JITTER_MS),
                            memory_order_relaxed);
   pka_arm (p, now);
+  if (cnt >= rekey_msg_limit)
+    init_send (d, p, false);
   return true;
 }
 
@@ -444,8 +504,6 @@ out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
   pthread_mutex_unlock (&d->data_lock);
   return true;
 }
-
-static void init_send (Dev *, Peer *, bool);
 
 static void
 stage (Peer *p, const uint8_t *buf, size_t len)
@@ -609,8 +667,9 @@ static void
 init_get (Dev *d, const Ep *src, MsgInit *m)
 {
   Peer *p, *tmp;
+  uint64_t now = data_now ();
   if (!mac_ok (d, src, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2),
-               m->sender))
+               m->sender, now))
     return;
   awg_type_normalize (m, AWG_INIT);
   HASH_ITER (hh, d->peer, p, tmp)
@@ -620,7 +679,8 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
     uint8_t *buf = malloc (cap);
     MsgResp *r = (void *)buf;
     uint32_t li;
-    if (!buf || !noise_init_get (&n, m))
+    if (!buf || !noise_init_get (&n, m)
+        || (p->last_init_ms && now - p->last_init_ms <= HANDSHAKE_INIT_MS))
       {
         free (buf);
         continue;
@@ -628,6 +688,7 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
     if (p->hs.li)
       idx_del (&d->idx, p->hs.li);
     p->hs = n;
+    p->last_init_ms = now;
     li = idx_add (&d->idx, p, IDX_HS);
     if (!li || !noise_resp_make (&p->hs, r, li))
       {
@@ -639,9 +700,9 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
       }
     roam (p, src);
     atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
-    atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
+    atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
     atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
-    pka_arm (p, data_now ());
+    pka_arm (p, now);
     awg_type_set (&d->awg, AWG_RESP, r);
     mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
     if (!idx_fnd (d->idx, li) || !kp_set (d, p, false))
@@ -667,7 +728,7 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   Peer *p;
   uint32_t li = le32toh (m->recv);
   if (!mac_ok (d, src, m, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2),
-               m->sender)
+               m->sender, data_now ())
       || !(e = idx_fnd (d->idx, li)) || e->type != IDX_HS)
     return;
   awg_type_normalize (m, AWG_RESP);
@@ -685,6 +746,7 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   p->hs_next = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
+  p->rekey_sent = false;
   data_send (d, p, NULL, 0);
   flush (d, p);
 }
@@ -782,13 +844,21 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
   if (promoted)
-    hs_time (p);
-  if (p->kp.initiator && !p->hs_pending
-      && now - p->kp.born >= refresh_receiving_ms (d))
-    init_send (d, p, false);
+    {
+      hs_time (p);
+      p->rekey_sent = false;
+    }
+  if (p->kp.initiator && !p->rekey_sent
+       && now - p->kp.born >= refresh_receiving_ms (d))
+    {
+      p->rekey_sent = true;
+      init_send (d, p, false);
+    }
   pthread_mutex_unlock (&d->data_lock);
   if (!n)
     return;
+  if (plain[0])
+    ka_received (d, p, now);
   if (n >= 20 && (plain[0] >> 4) == 4)
     {
       size_t ihl = (size_t)(plain[0] & 15U) * 4U;
@@ -808,7 +878,6 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
     return;
   if (iplen > n || aip_fnd (d, af, sip) != p)
     return;
-  ka_received (d, p, now);
   tun_write (d->tun, plain, iplen);
 }
 
@@ -884,7 +953,10 @@ data_tick (Dev *d, uint64_t now)
       }
     uint64_t pka = atomic_load_explicit (&p->pka_due, memory_order_relaxed);
     if (pka && now >= pka)
-      data_keepalive (d, p);
+      {
+        atomic_store_explicit (&p->pka_due, 0, memory_order_relaxed);
+        data_keepalive (d, p);
+      }
   }
 }
 
@@ -955,26 +1027,104 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
       pthread_rwlock_unlock (&d->lock);
       return;
     }
+  if ((type == AWG_INIT && len != sizeof (MsgInit))
+      || (type == AWG_RESP && len != sizeof (MsgResp))
+      || (type == AWG_COOKIE && len != sizeof (MsgCookie)))
+    return;
+  pthread_mutex_lock (&d->hs_lock);
+  if (d->hs_n < HS_QUEUE_CAP)
+    {
+      HsJob *job = &d->hs[(d->hs_head + d->hs_n) % HS_QUEUE_CAP];
+      job->ep = *src;
+      job->len = len;
+      job->type = type;
+      memcpy (job->buf, buf, len);
+      d->hs_n++;
+      if (d->hs_n >= HS_QUEUE_CAP / 8U)
+        d->hs_busy_until = data_now () + 1000U;
+      pthread_cond_signal (&d->hs_ready);
+    }
+  pthread_mutex_unlock (&d->hs_lock);
+}
+
+static void
+hs_handle (Dev *d, HsJob *job)
+{
   pthread_rwlock_wrlock (&d->lock);
-  switch (type)
+  switch (job->type)
     {
     case AWG_INIT:
-      if (len == sizeof (MsgInit))
-        init_get (d, src, (void *)buf);
+      init_get (d, &job->ep, (void *)job->buf);
       break;
     case AWG_RESP:
-      if (len == sizeof (MsgResp))
-        resp_get (d, src, (void *)buf);
+      resp_get (d, &job->ep, (void *)job->buf);
       break;
     case AWG_COOKIE:
-      if (len == sizeof (MsgCookie))
-        {
-          awg_type_normalize (buf, AWG_COOKIE);
-          cookie_get (d, (const void *)buf);
-        }
+      awg_type_normalize (job->buf, AWG_COOKIE);
+      cookie_get (d, (const void *)job->buf);
       break;
     }
   pthread_rwlock_unlock (&d->lock);
+}
+
+static void *
+hs_worker (void *arg)
+{
+  Dev *d = arg;
+  for (;;)
+    {
+      HsJob job;
+      pthread_mutex_lock (&d->hs_lock);
+      while (!d->hs_n && !d->hs_stop)
+        pthread_cond_wait (&d->hs_ready, &d->hs_lock);
+      if (!d->hs_n && d->hs_stop)
+        {
+          pthread_mutex_unlock (&d->hs_lock);
+          return NULL;
+        }
+      job = d->hs[d->hs_head];
+      d->hs_head = (d->hs_head + 1U) % HS_QUEUE_CAP;
+      d->hs_n--;
+      d->hs_active++;
+      pthread_mutex_unlock (&d->hs_lock);
+      hs_handle (d, &job);
+      pthread_mutex_lock (&d->hs_lock);
+      d->hs_active--;
+      if (!d->hs_n && !d->hs_active)
+        pthread_cond_broadcast (&d->hs_idle);
+      pthread_mutex_unlock (&d->hs_lock);
+    }
+}
+
+int
+data_hs_start (Dev *d)
+{
+  return pthread_create (&d->hs_thread, NULL, hs_worker, d) ? -1 : 0;
+}
+
+void
+data_hs_drain (Dev *d)
+{
+  pthread_mutex_lock (&d->hs_lock);
+  while (d->hs_n || d->hs_active)
+    pthread_cond_wait (&d->hs_idle, &d->hs_lock);
+  pthread_mutex_unlock (&d->hs_lock);
+}
+
+void
+data_hs_free (Dev *d)
+{
+  pthread_mutex_lock (&d->hs_lock);
+  d->hs_stop = true;
+  pthread_cond_signal (&d->hs_ready);
+  pthread_mutex_unlock (&d->hs_lock);
+  pthread_join (d->hs_thread, NULL);
+  while (d->hs_rate)
+    {
+      HsRate *next = d->hs_rate->next;
+      free (d->hs_rate);
+      d->hs_rate = next;
+    }
 }
 
 void
@@ -1025,8 +1175,12 @@ data_commit (WorkJob *j)
     goto out;
   if (j->type == WORK_OUT)
     {
-      int fd = sock (d, &j->ep);
-      if (fd >= 0 && udp_send (fd, &j->ep, j->buf, j->len) == (ssize_t)j->len)
+      Ep ep;
+      pthread_mutex_lock (&d->data_lock);
+      ep = p->addr;
+      pthread_mutex_unlock (&d->data_lock);
+      int fd = sock (d, &ep);
+      if (fd >= 0 && udp_send (fd, &ep, j->buf, j->len) == (ssize_t)j->len)
         {
           atomic_fetch_add_explicit (&p->tx, j->len, memory_order_relaxed);
           uint64_t now = data_now ();
@@ -1034,9 +1188,15 @@ data_commit (WorkJob *j)
                                  memory_order_relaxed);
           atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
           if (j->data_sent)
-            atomic_store_explicit (&p->hs_due, now + new_handshake_ms (d),
-                                   memory_order_relaxed);
+            if (!atomic_load_explicit (&p->hs_due, memory_order_relaxed))
+              atomic_store_explicit (
+                  &p->hs_due,
+                  now + new_handshake_ms (d)
+                       + randombytes_uniform (RETRY_JITTER_MS),
+                   memory_order_relaxed);
           pka_arm (p, now);
+          if (j->cnt >= rekey_msg_limit)
+            atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
         }
       goto out;
     }
@@ -1063,16 +1223,24 @@ data_commit (WorkJob *j)
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
   if (promoted)
-    hs_time (p);
-  if (p->kp.initiator && !p->hs_pending
-      && now - p->kp.born >= refresh_receiving_ms (d))
-    init_send (d, p, false);
+    {
+      hs_time (p);
+      p->rekey_sent = false;
+    }
+  if (p->kp.initiator && !p->rekey_sent
+       && now - p->kp.born >= refresh_receiving_ms (d))
+    {
+      p->rekey_sent = true;
+      init_send (d, p, false);
+    }
   pthread_mutex_unlock (&d->data_lock);
   if (j->len)
     {
       const uint8_t *sip;
       size_t iplen;
       int af;
+      if (j->buf[0])
+        ka_received (d, p, now);
       if (j->len >= 20 && (j->buf[0] >> 4) == 4)
         {
           size_t ihl = (size_t)(j->buf[0] & 15U) * 4U;
@@ -1093,7 +1261,6 @@ data_commit (WorkJob *j)
       if (iplen <= j->len && aip_fnd (d, af, sip) == p)
         {
           pka_arm (p, now);
-          ka_received (d, p, now);
           tun_write (d->tun, j->buf, iplen);
         }
     }

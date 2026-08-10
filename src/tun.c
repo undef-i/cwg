@@ -23,6 +23,8 @@
 #define TUNGETIFF _IOR ('T', 210, unsigned int)
 #endif
 
+enum { DEFAULT_MTU = 1420 };
+
 int
 tun_open (const char *name)
 {
@@ -60,9 +62,9 @@ tun_mtu (const char *name)
 {
   struct ifreq ifr = { 0 };
   int fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  int mtu = 0;
+  int mtu = DEFAULT_MTU;
   if (fd < 0)
-    return 0;
+    return mtu;
   snprintf (ifr.ifr_name, sizeof (ifr.ifr_name), "%s", name);
   if (ioctl (fd, SIOCGIFMTU, &ifr) == 0 && ifr.ifr_mtu > 0)
     mtu = ifr.ifr_mtu;

@@ -45,6 +45,13 @@ awg_init (Awg *a)
     a->h[i].lo = a->h[i].hi = i + 1U;
 }
 
+void
+awg_free (Awg *a)
+{
+  for (unsigned i = 0; i < 5; i++)
+    free (a->i[i]);
+}
+
 int
 awg_range_set (AwgRange *r, const char *value)
 {
@@ -163,12 +170,32 @@ awg_set (Awg *a, const char *key, const char *value)
     return awg_range_set (&a->max_handshake_attempts, value);
   if (key[0] == 'i' && key[1] >= '1' && key[1] <= '5' && !key[2])
     {
-      uint8_t check[AWG_PACKET_MAX];
+      uint8_t *check;
       size_t len;
-      if (strlen (value) >= sizeof (a->i[0]))
+      char *spec;
+      if (strlen (value) > AWG_PACKET_MAX)
         return -EINVAL;
-      strcpy (a->i[key[1] - '1'], value);
-      return awg_i_make (a, key[1] - '1', check, &len, sizeof (check));
+      spec = strdup (value);
+      if (!spec)
+        return -ENOMEM;
+      check = malloc (AWG_PACKET_MAX);
+      if (!check)
+        {
+          free (spec);
+          return -ENOMEM;
+        }
+      Awg copy = *a;
+      copy.i[key[1] - '1'] = spec;
+      if (awg_i_make (&copy, key[1] - '1', check, &len, AWG_PACKET_MAX) < 0)
+        {
+          free (check);
+          free (spec);
+          return -EINVAL;
+        }
+      free (check);
+      free (a->i[key[1] - '1']);
+      a->i[key[1] - '1'] = spec;
+      return 0;
     }
   return -ENOENT;
 }
@@ -300,7 +327,6 @@ awg_unwrap (const Awg *a, uint8_t *buf, size_t *len, unsigned *type)
                                        nonce, a->hp_key);
     }
   memmove (buf, buf + pad, *len - pad);
-  /* Keep the AWG header for MAC validation; callers normalize after it. */
   *len -= pad;
   *type = found;
   return 0;
@@ -357,6 +383,11 @@ awg_i_make (const Awg *a, unsigned index, uint8_t *out, size_t *len,
   if (!a || !out || !len || index >= 5U)
     return -EINVAL;
   p = a->i[index];
+  if (!p)
+    {
+      *len = 0;
+      return 0;
+    }
   while (*p)
     {
       char tag[4] = { 0 };

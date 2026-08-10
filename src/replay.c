@@ -16,7 +16,7 @@ replay_check (const Replay *r, uint64_t counter)
 {
   uint64_t bit;
 
-  if (!r || counter >= REPLAY_LIMIT
+  if (counter >= REPLAY_LIMIT
       || (counter <= r->last && r->last - counter > REPLAY_WIN))
     return false;
   if (counter > r->last)

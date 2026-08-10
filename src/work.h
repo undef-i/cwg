@@ -23,7 +23,6 @@ struct WorkJob
   uint8_t peer[KEY_LEN];
   uint8_t key[KEY_LEN];
   uint64_t cnt;
-  uint64_t seq;
   uint32_t index;
   uint32_t receiver;
   size_t len;
