@@ -31,12 +31,52 @@ awg_ms (const AwgRange *r, uint32_t fallback)
   return (uint64_t)awg_range_pick (r, fallback / 1000U) * 1000U;
 }
 
+static uint64_t
+awg_lo_ms (const AwgRange *r, uint32_t fallback)
+{
+  return (uint64_t)(r->lo || r->hi ? r->lo : fallback / 1000U) * 1000U;
+}
+
+static uint64_t
+awg_hi_ms (const AwgRange *r, uint32_t fallback)
+{
+  return (uint64_t)(r->lo || r->hi ? r->hi : fallback / 1000U) * 1000U;
+}
+
+static uint64_t
+new_handshake_ms (const Dev *d)
+{
+  return awg_hi_ms (&d->awg.keepalive_timeout, KEEPALIVE_MS)
+         + awg_ms (&d->awg.rekey_timeout, RETRY_MS);
+}
+
+static uint64_t
+refresh_receiving_ms (const Dev *d)
+{
+  uint64_t reject = awg_ms (&d->awg.reject_after, REJECT_MS);
+  uint64_t keepalive = awg_lo_ms (&d->awg.keepalive_timeout, KEEPALIVE_MS);
+  uint64_t rekey = awg_lo_ms (&d->awg.rekey_timeout, RETRY_MS);
+  return reject > keepalive + rekey ? reject - keepalive - rekey : 0;
+}
+
 static void
 pka_arm (Peer *p, uint64_t now)
 {
   if (p->ka.lo || p->ka.hi)
     atomic_store_explicit (&p->pka_due,
                            now + (uint64_t)awg_range_pick (&p->ka, 0) * 1000U,
+                           memory_order_relaxed);
+}
+
+static void
+ka_received (Dev *d, Peer *p, uint64_t now)
+{
+  if (atomic_load_explicit (&p->ka_due, memory_order_relaxed))
+    p->ka_again = true;
+  else
+    atomic_store_explicit (&p->ka_due,
+                           now + awg_ms (&d->awg.keepalive_timeout,
+                                         KEEPALIVE_MS),
                            memory_order_relaxed);
 }
 
@@ -66,10 +106,11 @@ send_pkt (Dev *d, Peer *p, const void *buf, size_t len, bool auth)
       atomic_fetch_add_explicit (&p->tx, len, memory_order_relaxed);
       if (auth)
         {
-          atomic_store_explicit (&p->last_tx, data_now (),
+          uint64_t now = data_now ();
+          atomic_store_explicit (&p->last_tx, now,
                                  memory_order_relaxed);
           atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
-          pka_arm (p, data_now ());
+          pka_arm (p, now);
         }
       return true;
     }
@@ -292,7 +333,7 @@ kp_set (Dev *d, Peer *p, bool initiator)
 static bool
 kp_live (const Dev *d, const Kp *k, uint64_t now)
 {
-  return k->ok && now - k->born < awg_ms (&d->awg.reject_after, REJECT_MS)
+  return k->ok && now - k->born < awg_hi_ms (&d->awg.reject_after, REJECT_MS)
          && atomic_load_explicit (&k->cnt, memory_order_relaxed)
                 < REPLAY_LIMIT;
 }
@@ -357,8 +398,13 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
   if (!sent)
     return false;
   atomic_fetch_add_explicit (&p->tx, outlen, memory_order_relaxed);
-  atomic_store_explicit (&p->last_tx, data_now (), memory_order_relaxed);
+  uint64_t now = data_now ();
+  atomic_store_explicit (&p->last_tx, now, memory_order_relaxed);
   atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
+  if (len)
+    atomic_store_explicit (&p->hs_due, now + new_handshake_ms (d),
+                           memory_order_relaxed);
+  pka_arm (p, now);
   return true;
 }
 
@@ -391,6 +437,7 @@ out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
   j->cnt = cnt;
   j->index = p->kp.li;
   j->receiver = p->kp.ri;
+  j->data_sent = len != 0;
   j->len = len;
   if (len)
     memcpy (j->buf, buf, len);
@@ -591,6 +638,7 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
     roam (p, src);
     atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
     atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
+    atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
     pka_arm (p, data_now ());
     awg_type_set (&d->awg, AWG_RESP, r);
     mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
@@ -627,6 +675,7 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   roam (p, src);
   atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
+  atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
   pka_arm (p, data_now ());
   hs_time (p);
   p->hs_pending = false;
@@ -689,7 +738,8 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
       return;
     }
   k = e->ptr;
-  if (!k->ok || now - k->born >= awg_ms (&d->awg.reject_after, REJECT_MS)
+  if (!k->ok || now - k->born
+                    >= awg_hi_ms (&d->awg.reject_after, REJECT_MS)
       || cnt >= REPLAY_LIMIT)
     {
       pthread_mutex_unlock (&d->data_lock);
@@ -722,6 +772,7 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
   roam (p, src);
   atomic_fetch_add_explicit (&p->rx, len, memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
+  atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
   pka_arm (p, now);
   p->hs_pending = false;
   p->hs_start = 0;
@@ -730,6 +781,9 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
   p->hs_max_attempts = 0;
   if (promoted)
     hs_time (p);
+  if (p->kp.initiator && !p->hs_pending
+      && now - p->kp.born >= refresh_receiving_ms (d))
+    init_send (d, p, false);
   pthread_mutex_unlock (&d->data_lock);
   if (!n)
     return;
@@ -752,10 +806,7 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
     return;
   if (iplen > n || aip_fnd (d, af, sip) != p)
     return;
-  atomic_store_explicit (&p->ka_due,
-                         now + awg_ms (&d->awg.keepalive_timeout,
-                                       KEEPALIVE_MS),
-                         memory_order_relaxed);
+  ka_received (d, p, now);
   tun_write (d->tun, plain, iplen);
 }
 
@@ -775,7 +826,7 @@ data_tick (Dev *d, uint64_t now)
   Peer *p, *tmp;
   HASH_ITER (hh, d->peer, p, tmp)
   {
-    uint64_t reject = awg_ms (&d->awg.reject_after, REJECT_MS);
+    uint64_t reject = awg_hi_ms (&d->awg.reject_after, REJECT_MS);
     if (p->prev.ok && now - p->prev.born >= reject)
       kp_drop (d, &p->prev);
     if (p->pending.ok && now - p->pending.born >= reject)
@@ -811,7 +862,23 @@ data_tick (Dev *d, uint64_t now)
     uint64_t due = atomic_load_explicit (&p->ka_due, memory_order_relaxed);
     if (due && now >= due)
       {
+        atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
         data_keepalive (d, p);
+        if (p->ka_again)
+          {
+            p->ka_again = false;
+            atomic_store_explicit (&p->ka_due,
+                                   now + awg_ms (&d->awg.keepalive_timeout,
+                                                 KEEPALIVE_MS),
+                                   memory_order_relaxed);
+          }
+      }
+    uint64_t handshake_due
+        = atomic_load_explicit (&p->hs_due, memory_order_relaxed);
+    if (handshake_due && now >= handshake_due && !p->hs_pending)
+      {
+        atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
+        init_send (d, p, false);
       }
     uint64_t pka = atomic_load_explicit (&p->pka_due, memory_order_relaxed);
     if (pka && now >= pka)
@@ -857,8 +924,8 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
       pthread_mutex_lock (&d->data_lock);
       e = idx_fnd (d->idx, job->index);
       if (!e || e->type != IDX_KP || !(k = e->ptr) || !k->ok
-          || data_now () - k->born
-                 >= awg_ms (&d->awg.reject_after, REJECT_MS)
+           || data_now () - k->born
+                  >= awg_hi_ms (&d->awg.reject_after, REJECT_MS)
           || job->cnt >= REPLAY_LIMIT)
         {
           pthread_mutex_unlock (&d->data_lock);
@@ -960,9 +1027,14 @@ data_commit (WorkJob *j)
       if (fd >= 0 && udp_send (fd, &j->ep, j->buf, j->len) == (ssize_t)j->len)
         {
           atomic_fetch_add_explicit (&p->tx, j->len, memory_order_relaxed);
-          atomic_store_explicit (&p->last_tx, data_now (),
+          uint64_t now = data_now ();
+          atomic_store_explicit (&p->last_tx, now,
                                  memory_order_relaxed);
           atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
+          if (j->data_sent)
+            atomic_store_explicit (&p->hs_due, now + new_handshake_ms (d),
+                                   memory_order_relaxed);
+          pka_arm (p, now);
         }
       goto out;
     }
@@ -981,11 +1053,18 @@ data_commit (WorkJob *j)
   roam (p, &j->ep);
   atomic_fetch_add_explicit (&p->rx, j->wire_len, memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
+  atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
+  pka_arm (p, now);
   p->hs_pending = false;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->hs_attempts = 0;
+  p->hs_max_attempts = 0;
   if (promoted)
     hs_time (p);
+  if (p->kp.initiator && !p->hs_pending
+      && now - p->kp.born >= refresh_receiving_ms (d))
+    init_send (d, p, false);
   pthread_mutex_unlock (&d->data_lock);
   if (j->len)
     {
@@ -1012,10 +1091,7 @@ data_commit (WorkJob *j)
       if (iplen <= j->len && aip_fnd (d, af, sip) == p)
         {
           pka_arm (p, now);
-          atomic_store_explicit (&p->ka_due,
-                                 now + awg_ms (&d->awg.keepalive_timeout,
-                                               KEEPALIVE_MS),
-                                 memory_order_relaxed);
+          ka_received (d, p, now);
           tun_write (d->tun, j->buf, iplen);
         }
     }

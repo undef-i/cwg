@@ -29,6 +29,7 @@ struct WorkJob
   size_t len;
   size_t wire_len;
   unsigned type;
+  bool data_sent;
   bool ok;
   atomic_uint state;
   struct WorkJob *next;

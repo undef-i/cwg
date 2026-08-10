@@ -64,10 +64,12 @@ dev_peer_reset (Dev *d, Peer *p)
   p->last_rx = 0;
   p->ka_due = 0;
   p->pka_due = 0;
+  p->hs_due = 0;
   p->hs_start = 0;
   p->hs_next = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
+  p->ka_again = false;
   p->hs_pending = false;
   if (d->has_sk)
     noise_init (&p->hs, d->sk, p->pk, p->psk);

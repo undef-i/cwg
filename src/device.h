@@ -57,10 +57,12 @@ struct Peer
   atomic_uint_fast64_t last_rx;
   atomic_uint_fast64_t ka_due;
   atomic_uint_fast64_t pka_due;
+  atomic_uint_fast64_t hs_due;
   uint64_t hs_start;
   uint64_t hs_next;
   uint32_t hs_attempts;
   uint32_t hs_max_attempts;
+  bool ka_again;
   bool hs_pending;
   Noise hs;
   Kp kp;
