@@ -555,6 +555,8 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
     af = AF_INET6, dst = buf + 24;
   else
     return;
+  if (!d->up)
+    return;
   pthread_rwlock_rdlock (&d->lock);
   p = aip_fnd (d, af, dst);
   if (!p)

@@ -1,4 +1,5 @@
 #include "device.h"
+#include "data.h"
 #include "work.h"
 
 #include <errno.h>
@@ -237,10 +238,13 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
 int
 dev_up (Dev *d, bool up)
 {
+  Peer *p, *tmp;
   if (d->up == up)
     return 0;
   if (!up)
     {
+      work_drain ();
+      HASH_ITER (hh, d->peer, p, tmp) dev_peer_reset (d, p);
       d->up = false;
       udp_close (d->udp4, d->udp6);
       d->udp4 = d->udp6 = -1;
@@ -250,5 +254,8 @@ dev_up (Dev *d, bool up)
   if (dev_bind (d, d->bind_port, d->mark) < 0)
     return -1;
   d->up = true;
+  HASH_ITER (hh, d->peer, p, tmp)
+    if (p->ka.lo || p->ka.hi)
+      data_keepalive (d, p);
   return 0;
 }
