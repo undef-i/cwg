@@ -268,6 +268,15 @@ set_run (Dev *d, FILE *f)
 }
 
 static void
+get_allowed_ip (int af, const uint8_t ip[16], uint8_t cidr, void *arg)
+{
+  FILE *f = arg;
+  char text[INET6_ADDRSTRLEN];
+  if (inet_ntop (af, ip, text, sizeof (text)))
+    fprintf (f, "allowed_ip=%s/%u\n", text, cidr);
+}
+
+static void
 get_run (Dev *d, FILE *f)
 {
   char hex[HEX_LEN + 1];
@@ -347,12 +356,7 @@ get_run (Dev *d, FILE *f)
         fprintf (f, "persistent_keepalive_interval=%s\n",
                  awg_range_get (&p->ka, range));
       }
-    for (Aip *a = d->aip; a; a = a->next)
-      {
-        char ip[INET6_ADDRSTRLEN];
-        if (a->peer == p && inet_ntop (a->af, a->ip, ip, sizeof (ip)))
-          fprintf (f, "allowed_ip=%s/%u\n", ip, a->cidr);
-      }
+    aip_each (d, p, get_allowed_ip, f);
   }
 }
 

@@ -142,7 +142,8 @@ struct Dev
   Awg awg;
   Peer *peer;
   Peer *retired;
-  Aip *aip;
+  AipNode *aip4;
+  AipNode *aip6;
   Idx *idx;
   pthread_rwlock_t lock;
   pthread_mutex_t data_lock;

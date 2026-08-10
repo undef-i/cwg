@@ -151,6 +151,7 @@ dev_free (Dev *d)
   uapi_drain (d);
   dev_peer_clr (d);
   dev_reap (d);
+  aip_free (d);
   idx_clr (&d->idx);
   pthread_cond_destroy (&d->hs_idle);
   pthread_cond_destroy (&d->hs_ready);
