@@ -185,7 +185,7 @@ loop_run (Dev *head, int ctl)
             next = due;
         }
       struct itimerspec its = { 0 };
-      uint64_t wait = next && next > now ? next - now : 1000U;
+      uint64_t wait = next ? (next > now ? next - now : 1U) : 1000U;
       its.it_value.tv_sec = (time_t)(wait / 1000U);
       its.it_value.tv_nsec = (long)(wait % 1000U) * 1000000L;
       if (timerfd_settime (timer, 0, &its, NULL) < 0)

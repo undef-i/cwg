@@ -992,39 +992,40 @@ data_tick (Dev *d, uint64_t now)
 }
 
 static uint64_t
-due_min (uint64_t due, uint64_t next, uint64_t now)
+due_min (uint64_t due, uint64_t next)
 {
-  return due && due > now && (!next || due < next) ? due : next;
+  return due && (!next || due < next) ? due : next;
 }
 
 uint64_t
-data_next_due (Dev *d, uint64_t now)
+data_next_due (Dev *d, uint64_t unused)
 {
   Peer *p, *tmp;
   uint64_t next = 0;
+  (void)unused;
   HASH_ITER (hh, d->peer, p, tmp)
     {
-      next = due_min (p->hs_pending ? p->hs_next : p->rekey_due, next, now);
+      next = due_min (p->hs_pending ? p->hs_next : p->rekey_due, next);
       next = due_min (atomic_load_explicit (&p->ka_due, memory_order_relaxed),
-                      next, now);
+                      next);
       next = due_min (atomic_load_explicit (&p->pka_due, memory_order_relaxed),
-                      next, now);
+                      next);
       next = due_min (atomic_load_explicit (&p->hs_due, memory_order_relaxed),
-                      next, now);
+                      next);
       next = due_min (atomic_load_explicit (&p->zero_due, memory_order_relaxed),
-                      next, now);
+                      next);
       if (p->prev.ok)
         next = due_min (p->prev.born
                             + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
-                        next, now);
+                        next);
       if (p->pending.ok)
         next = due_min (p->pending.born
                             + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
-                        next, now);
+                        next);
       if (p->kp.ok)
         next = due_min (p->kp.born
                             + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
-                        next, now);
+                        next);
     }
   return next;
 }
