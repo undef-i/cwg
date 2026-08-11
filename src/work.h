@@ -1,5 +1,6 @@
 #pragma once
 
+#include "awg.h"
 #include "common.h"
 #include "udp.h"
 
@@ -25,6 +26,8 @@ struct WorkJob
   uint64_t cnt;
   uint32_t index;
   uint32_t receiver;
+  Awg awg;
+  int mtu;
   size_t len;
   size_t wire_len;
   unsigned type;

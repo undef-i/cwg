@@ -12,14 +12,17 @@
 static int
 port_get (const char *s, uint16_t *port)
 {
-  char *end;
-  unsigned long n;
+  uint64_t n = 0;
 
   if (!*s)
     return -1;
-  errno = 0;
-  n = strtoul (s, &end, 10);
-  if (errno || *end || n > UINT16_MAX)
+  for (const char *p = s; *p; p++)
+    {
+      if (*p < '0' || *p > '9' || n > (UINT16_MAX - (unsigned)(*p - '0')) / 10U)
+        return -1;
+      n = n * 10U + (unsigned)(*p - '0');
+    }
+  if (n > UINT16_MAX)
     return -1;
   *port = (uint16_t)n;
   return 0;

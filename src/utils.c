@@ -59,6 +59,9 @@ u64_get (const char *s, uint64_t max, uint64_t *out)
   unsigned long long v;
   if (!s || !*s)
     return false;
+  for (const char *p = s; *p; p++)
+    if (*p < '0' || *p > '9')
+      return false;
   errno = 0;
   v = strtoull (s, &end, 10);
   if (errno || *end || v > max)

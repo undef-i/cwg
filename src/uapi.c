@@ -52,6 +52,11 @@ aip_set (Dev *d, Peer *p, const char *val)
   if (!slash)
     return -EINVAL;
   *slash++ = '\0';
+  if (slash[0] == '0' && slash[1])
+    return -EINVAL;
+  for (const char *p = slash; *p; p++)
+    if (*p < '0' || *p > '9')
+      return -EINVAL;
   cidr = strtoul (slash, &end, 10);
   if (*end)
     return -EINVAL;

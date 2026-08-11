@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 enum
 {
@@ -513,6 +512,9 @@ out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
     }
   j->dev = d;
   j->type = WORK_OUT;
+  j->awg = d->awg;
+  memset (j->awg.i, 0, sizeof (j->awg.i));
+  j->mtu = d->mtu;
   j->ep = p->addr;
   memcpy (j->peer, p->pk, sizeof (j->peer));
   memcpy (j->key, p->kp.tx, sizeof (j->key));
@@ -1033,8 +1035,13 @@ data_next_due (Dev *d, uint64_t unused)
 void
 data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
 {
+  Awg awg;
   unsigned type;
-  if (awg_unwrap (&d->awg, buf, &len, &type) < 0)
+  pthread_rwlock_rdlock (&d->lock);
+  awg = d->awg;
+  memset (awg.i, 0, sizeof (awg.i));
+  pthread_rwlock_unlock (&d->lock);
+  if (awg_unwrap (&awg, buf, &len, &type) < 0)
     return;
   if (type == AWG_DATA)
     {
@@ -1169,28 +1176,7 @@ hs_worker (void *arg)
 int
 data_hs_start (Dev *d)
 {
-  long n = sysconf (_SC_NPROCESSORS_ONLN);
-  if (n < 1)
-    n = 1;
-  d->hs_thread_n = (unsigned)n;
-  d->hs_thread = calloc (d->hs_thread_n, sizeof (*d->hs_thread));
-  if (!d->hs_thread)
-    return -1;
-  for (unsigned i = 0; i < d->hs_thread_n; i++)
-    if (pthread_create (&d->hs_thread[i], NULL, hs_worker, d))
-      {
-        pthread_mutex_lock (&d->hs_lock);
-        d->hs_stop = true;
-        pthread_cond_broadcast (&d->hs_ready);
-        pthread_mutex_unlock (&d->hs_lock);
-        while (i)
-          pthread_join (d->hs_thread[--i], NULL);
-        free (d->hs_thread);
-        d->hs_thread = NULL;
-        d->hs_thread_n = 0;
-        return -1;
-      }
-  return 0;
+  return pthread_create (&d->hs_thread, NULL, hs_worker, d) ? -1 : 0;
 }
 
 void
@@ -1207,13 +1193,9 @@ data_hs_free (Dev *d)
 {
   pthread_mutex_lock (&d->hs_lock);
   d->hs_stop = true;
-  pthread_cond_broadcast (&d->hs_ready);
+  pthread_cond_signal (&d->hs_ready);
   pthread_mutex_unlock (&d->hs_lock);
-  for (unsigned i = 0; i < d->hs_thread_n; i++)
-    pthread_join (d->hs_thread[i], NULL);
-  free (d->hs_thread);
-  d->hs_thread = NULL;
-  d->hs_thread_n = 0;
+  pthread_join (d->hs_thread, NULL);
   hs_rate_prune (d, UINT64_MAX);
 }
 
@@ -1236,18 +1218,17 @@ data_work (WorkJob *j)
         .cnt = htole64 (j->cnt),
       };
       size_t plain = j->len;
-      size_t pad = plain + awg_content_pad (&j->dev->awg, plain,
-                                             j->dev->mtu);
+      size_t pad = plain + awg_content_pad (&j->awg, plain, j->mtu);
       size_t n;
       memmove (j->buf + sizeof (m), j->buf, plain);
-      awg_type_set (&j->dev->awg, AWG_DATA, &m);
+      awg_type_set (&j->awg, AWG_DATA, &m);
       memcpy (j->buf, &m, sizeof (m));
       memset (j->buf + sizeof (m) + plain, 0, pad - plain);
       j->ok = aead_enc (j->buf + sizeof (m), &n, j->buf + sizeof (m), pad,
                         NULL, 0, j->cnt, j->key);
       j->len = j->ok ? sizeof (m) + n : 0;
       if (j->ok
-          && awg_wrap (&j->dev->awg, AWG_DATA, j->buf, &j->len,
+          && awg_wrap (&j->awg, AWG_DATA, j->buf, &j->len,
                        sizeof (j->buf)) < 0)
         j->ok = false;
     }

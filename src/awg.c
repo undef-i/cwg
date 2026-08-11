@@ -1,6 +1,7 @@
 #include "awg.h"
 
 #include "wire.h"
+#include "utils.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -55,24 +56,28 @@ awg_free (Awg *a)
 int
 awg_range_set (AwgRange *r, const char *value)
 {
-  char *end;
-  unsigned long lo, hi;
+  uint64_t lo, hi;
   if (!value || !*value)
     return -EINVAL;
-  errno = 0;
-  lo = strtoul (value, &end, 10);
-  if (errno || end == value || lo > UINT32_MAX)
+  const char *end = value;
+  while (*end && *end != '-')
+    end++;
+  char first[11];
+  size_t n = (size_t)(end - value);
+  if (!n || n >= sizeof (first))
+    return -EINVAL;
+  memcpy (first, value, n);
+  first[n] = '\0';
+  if (!u64_get (first, UINT32_MAX, &lo))
     return -EINVAL;
   hi = lo;
   if (*end == '-')
     {
       const char *s = end + 1;
-      errno = 0;
-      hi = strtoul (s, &end, 10);
-      if (errno || end == s || hi > UINT32_MAX)
+      if (!u64_get (s, UINT32_MAX, &hi))
         return -EINVAL;
     }
-  if (*end || hi < lo)
+  if (hi < lo)
     return -EINVAL;
   r->lo = (uint32_t)lo;
   r->hi = (uint32_t)hi;
@@ -112,23 +117,17 @@ awg_set (Awg *a, const char *key, const char *value)
   if (!strcmp (key, "s1") || !strcmp (key, "s2") || !strcmp (key, "s3")
       || !strcmp (key, "s4"))
     {
-      char *end;
-      unsigned long v;
-      errno = 0;
-      v = strtoul (value, &end, 10);
-      n = key[1] - '1';
-      if (errno || end == value || *end || v > UINT16_MAX)
+       uint64_t v;
+       n = key[1] - '1';
+       if (!u64_get (value, UINT16_MAX, &v))
         return -EINVAL;
       a->s[n] = (uint32_t)v;
       return 0;
     }
   if (!strcmp (key, "jc") || !strcmp (key, "jmin") || !strcmp (key, "jmax"))
     {
-      char *end;
-      unsigned long v;
-      errno = 0;
-      v = strtoul (value, &end, 10);
-      if (errno || end == value || *end || v > UINT32_MAX)
+       uint64_t v;
+       if (!u64_get (value, UINT32_MAX, &v))
         return -EINVAL;
       if (!strcmp (key, "jc"))
         {
@@ -335,11 +334,8 @@ awg_unwrap (const Awg *a, uint8_t *buf, size_t *len, unsigned *type)
 static int
 arg_get (const char *s, unsigned *value)
 {
-  char *end;
-  unsigned long n;
-  errno = 0;
-  n = strtoul (s, &end, 10);
-  if (errno || end == s || *end || n > AWG_PACKET_MAX)
+  uint64_t n;
+  if (!u64_get (s, AWG_PACKET_MAX, &n))
     return -EINVAL;
   *value = (unsigned)n;
   return 0;

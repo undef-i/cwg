@@ -151,8 +151,7 @@ struct Dev
   pthread_mutex_t hs_lock;
   pthread_cond_t hs_ready;
   pthread_cond_t hs_idle;
-  pthread_t *hs_thread;
-  unsigned hs_thread_n;
+  pthread_t hs_thread;
   bool hs_stop;
   pthread_mutex_t uapi_lock;
   pthread_cond_t uapi_idle;
