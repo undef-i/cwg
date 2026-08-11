@@ -10,6 +10,7 @@ void data_hs_drain (Dev *d);
 void data_hs_free (Dev *d);
 void data_keepalive (Dev *d, Peer *p);
 void data_tick (Dev *d, uint64_t now);
+uint64_t data_next_due (Dev *d, uint64_t now);
 uint64_t data_now (void);
 void data_work (WorkJob *j);
 void data_commit (WorkJob *j);

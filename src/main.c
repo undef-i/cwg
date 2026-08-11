@@ -24,13 +24,31 @@ on_sig (int sig)
 }
 
 static int
-daemonize (void)
+daemonize (int *ready)
 {
+  uint8_t status = 0;
+  int pipefd[2];
+  if (pipe2 (pipefd, O_CLOEXEC) < 0)
+    return -1;
   pid_t pid = fork ();
   if (pid < 0)
-    return -1;
+    {
+      close (pipefd[0]);
+      close (pipefd[1]);
+      return -1;
+    }
   if (pid > 0)
-    return 1;
+    {
+      ssize_t n;
+      close (pipefd[1]);
+      do
+        n = read (pipefd[0], &status, sizeof (status));
+      while (n < 0 && errno == EINTR);
+      close (pipefd[0]);
+      return n == (ssize_t)sizeof (status) && status ? 1 : -1;
+    }
+  close (pipefd[0]);
+  *ready = pipefd[1];
   if (setsid () < 0)
     return -1;
   if (g_log != LOG_DBG)
@@ -85,6 +103,7 @@ main (int argc, char **argv)
   int ctl = -1;
   int tun_fd;
   int uapi_fd;
+  int ready = -1;
   bool inherited;
   int rc = 1;
 
@@ -164,6 +183,15 @@ main (int argc, char **argv)
   if (errno == ECONNREFUSED)
     unlink (CTL_PATH);
 
+  if (!fg)
+    {
+      int dr = daemonize (&ready);
+      if (dr < 0)
+        return 1;
+      if (dr > 0)
+        return 0;
+    }
+
   d = dev_new (name);
   if (!d)
     return 1;
@@ -191,23 +219,28 @@ main (int argc, char **argv)
       err ("master: %s", strerror (errno));
       goto out;
     }
-  if (!fg)
+  if (ready >= 0)
     {
-      int dr = daemonize ();
-      if (dr < 0)
-        goto out;
-      if (dr > 0)
-        return 0;
+      uint8_t status = 1;
+      write (ready, &status, sizeof (status));
+      close (ready);
+      ready = -1;
     }
-
   signal (SIGINT, on_sig);
   signal (SIGTERM, on_sig);
   signal (SIGHUP, on_sig);
+  signal (SIGPIPE, SIG_IGN);
   dbg ("(%s) up", d->name);
   rc = loop_run (d, ctl) < 0;
   d = NULL;
 
 out:
+  if (ready >= 0)
+    {
+      uint8_t status = 0;
+      write (ready, &status, sizeof (status));
+      close (ready);
+    }
   ctl_close (ctl);
   if (d)
     {

@@ -83,6 +83,7 @@ struct Peer
   uint64_t hs_start;
   uint64_t hs_next;
   uint64_t hs_last_sent;
+  uint64_t rekey_due;
   uint64_t last_init_ms;
   uint32_t hs_attempts;
   uint32_t hs_max_attempts;
@@ -150,7 +151,8 @@ struct Dev
   pthread_mutex_t hs_lock;
   pthread_cond_t hs_ready;
   pthread_cond_t hs_idle;
-  pthread_t hs_thread;
+  pthread_t *hs_thread;
+  unsigned hs_thread_n;
   bool hs_stop;
   pthread_mutex_t uapi_lock;
   pthread_cond_t uapi_idle;

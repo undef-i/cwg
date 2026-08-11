@@ -12,6 +12,7 @@
 #include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop;
@@ -37,6 +38,8 @@ enum
   FD_UDP,
   FD_INOTIFY,
   FD_WORK,
+  FD_LINK,
+  FD_TIMER,
 };
 
 static Dev *
@@ -98,8 +101,10 @@ loop_run (Dev *head, int ctl)
   UdpPacket *pkt = calloc (UDP_BATCH_MAX, sizeof (*pkt));
   int ep = epoll_create1 (EPOLL_CLOEXEC);
   int ino = inotify_init1 (IN_CLOEXEC | IN_NONBLOCK);
+  int link = tun_watch_open ();
+  int timer = timerfd_create (CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
   int wg_watch = -1, awg_watch = -1;
-  if (ep < 0 || ino < 0 || !buf || !pkt)
+  if (ep < 0 || ino < 0 || link < 0 || timer < 0 || !buf || !pkt)
     {
       free (pkt);
       free (buf);
@@ -107,12 +112,18 @@ loop_run (Dev *head, int ctl)
         close (ep);
       if (ino >= 0)
         close (ino);
+      if (link >= 0)
+        close (link);
+      if (timer >= 0)
+        close (timer);
       return -1;
     }
   if (work_start (data_work, data_commit) < 0)
     {
       close (ep);
       close (ino);
+      close (link);
+      close (timer);
       free (pkt);
       free (buf);
       return -1;
@@ -129,6 +140,12 @@ loop_run (Dev *head, int ctl)
     goto fail;
   ev.data.fd = ino;
   if (epoll_ctl (ep, EPOLL_CTL_ADD, ino, &ev) < 0)
+    goto fail;
+  ev.data.fd = link;
+  if (epoll_ctl (ep, EPOLL_CTL_ADD, link, &ev) < 0)
+    goto fail;
+  ev.data.fd = timer;
+  if (epoll_ctl (ep, EPOLL_CTL_ADD, timer, &ev) < 0)
     goto fail;
   for (Dev *d = head; d; d = d->next)
     if (!socket_alive (d))
@@ -158,7 +175,22 @@ loop_run (Dev *head, int ctl)
 
   while (!g_stop && head)
     {
-      int n = epoll_wait (ep, arr, 64, 1000);
+      uint64_t now = data_now (), next = 0;
+      for (Dev *d = head; d; d = d->next)
+        {
+          pthread_rwlock_rdlock (&d->lock);
+          uint64_t due = data_next_due (d, now);
+          pthread_rwlock_unlock (&d->lock);
+          if (due && (!next || due < next))
+            next = due;
+        }
+      struct itimerspec its = { 0 };
+      uint64_t wait = next && next > now ? next - now : 1000U;
+      its.it_value.tv_sec = (time_t)(wait / 1000U);
+      its.it_value.tv_nsec = (long)(wait % 1000U) * 1000000L;
+      if (timerfd_settime (timer, 0, &its, NULL) < 0)
+        goto fail;
+      int n = epoll_wait (ep, arr, 64, -1);
       if (n < 0)
         {
           if (errno == EINTR)
@@ -216,6 +248,27 @@ loop_run (Dev *head, int ctl)
                   }
               if (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
                 goto fail;
+              continue;
+            }
+          if (arr[i].data.fd == link)
+            {
+              if (tun_watch_drain (link) < 0)
+                goto fail;
+              for (Dev *d = head; d;)
+                {
+                  Dev *next = d->next;
+                  d->mtu = tun_mtu (d->name);
+                  if (dev_up (d, tun_up (d->name)) < 0)
+                    dev_del (&head, d, ep);
+                  d = next;
+                }
+              continue;
+            }
+          if (arr[i].data.fd == timer)
+            {
+              uint64_t expirations;
+              while (read (timer, &expirations, sizeof (expirations)) > 0)
+                ;
               continue;
             }
           if (arr[i].data.fd == work_fd ())
@@ -288,7 +341,7 @@ loop_run (Dev *head, int ctl)
               break;
             }
         }
-      uint64_t now = data_now ();
+      now = data_now ();
       for (Dev *d = head; d;)
         {
           Dev *next = d->next;
@@ -296,13 +349,6 @@ loop_run (Dev *head, int ctl)
             dev_del (&head, d, ep);
           else
             {
-              d->mtu = tun_mtu (d->name);
-              if (dev_up (d, tun_up (d->name)) < 0)
-                {
-                  dev_del (&head, d, ep);
-                  d = next;
-                  continue;
-                }
               if (d->udp_seen != d->udp_gen)
                 {
                   if (d->udp4 >= 0)
@@ -327,6 +373,8 @@ loop_run (Dev *head, int ctl)
   dev_all_del (&head, ep);
   work_stop ();
   close (ino);
+  close (link);
+  close (timer);
   close (ep);
   free (pkt);
   free (buf);
@@ -336,6 +384,8 @@ fail:
   dev_all_del (&head, ep);
   work_stop ();
   close (ino);
+  close (link);
+  close (timer);
   close (ep);
   free (pkt);
   free (buf);

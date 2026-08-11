@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <sys/socket.h>
 #include <stdio.h>
 #include <string.h>
@@ -85,6 +87,43 @@ tun_up (const char *name)
     up = (ifr.ifr_flags & IFF_UP) != 0;
   close (fd);
   return up;
+}
+
+int
+tun_watch_open (void)
+{
+  struct sockaddr_nl sa = {
+    .nl_family = AF_NETLINK,
+    .nl_groups = RTMGRP_LINK,
+  };
+  int fd = socket (AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                   NETLINK_ROUTE);
+  if (fd < 0)
+    return -1;
+  if (bind (fd, (struct sockaddr *)&sa, sizeof (sa)) < 0)
+    {
+      close (fd);
+      return -1;
+    }
+  return fd;
+}
+
+int
+tun_watch_drain (int fd)
+{
+  uint8_t buf[8192];
+  ssize_t n;
+  bool changed = false;
+  do
+    n = recv (fd, buf, sizeof (buf), 0);
+  while (n < 0 && errno == EINTR);
+  if (n < 0)
+    return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+  for (struct nlmsghdr *nlh = (void *)buf; NLMSG_OK (nlh, (unsigned)n);
+       nlh = NLMSG_NEXT (nlh, n))
+    if (nlh->nlmsg_type == RTM_NEWLINK || nlh->nlmsg_type == RTM_DELLINK)
+      changed = true;
+  return changed;
 }
 
 ssize_t

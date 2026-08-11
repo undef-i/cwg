@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 enum
 {
@@ -372,6 +373,9 @@ kp_set (Dev *d, Peer *p, bool initiator)
   e->ptr = dst;
   e->type = IDX_KP;
   p->hs.li = 0;
+  p->rekey_due = initiator
+                     ? k.born + awg_ms (&d->awg.rekey_after, REKEY_MS)
+                     : 0;
   atomic_store_explicit (&p->zero_due,
                          k.born + awg_ms (&d->awg.reject_after, REJECT_MS) * 3U,
                          memory_order_relaxed);
@@ -405,6 +409,7 @@ key_clear (Dev *d, Peer *p)
   p->hs_pending = false;
   p->hs_start = 0;
   p->hs_next = 0;
+  p->rekey_due = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
   p->rekey_sent = false;
@@ -948,9 +953,7 @@ data_tick (Dev *d, uint64_t now)
         p->hs_attempts++;
         init_send (d, p, true);
       }
-    else if (!p->hs_pending && p->kp.ok && p->kp.initiator
-              && now - p->kp.born
-                     >= awg_ms (&d->awg.rekey_after, REKEY_MS))
+    else if (!p->hs_pending && p->rekey_due && now >= p->rekey_due)
       init_send (d, p, false);
     uint64_t due = atomic_load_explicit (&p->ka_due, memory_order_relaxed);
     if (due && now >= due)
@@ -988,6 +991,44 @@ data_tick (Dev *d, uint64_t now)
   }
 }
 
+static uint64_t
+due_min (uint64_t due, uint64_t next, uint64_t now)
+{
+  return due && due > now && (!next || due < next) ? due : next;
+}
+
+uint64_t
+data_next_due (Dev *d, uint64_t now)
+{
+  Peer *p, *tmp;
+  uint64_t next = 0;
+  HASH_ITER (hh, d->peer, p, tmp)
+    {
+      next = due_min (p->hs_pending ? p->hs_next : p->rekey_due, next, now);
+      next = due_min (atomic_load_explicit (&p->ka_due, memory_order_relaxed),
+                      next, now);
+      next = due_min (atomic_load_explicit (&p->pka_due, memory_order_relaxed),
+                      next, now);
+      next = due_min (atomic_load_explicit (&p->hs_due, memory_order_relaxed),
+                      next, now);
+      next = due_min (atomic_load_explicit (&p->zero_due, memory_order_relaxed),
+                      next, now);
+      if (p->prev.ok)
+        next = due_min (p->prev.born
+                            + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
+                        next, now);
+      if (p->pending.ok)
+        next = due_min (p->pending.born
+                            + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
+                        next, now);
+      if (p->kp.ok)
+        next = due_min (p->kp.born
+                            + awg_hi_ms (&d->awg.reject_after, REJECT_MS),
+                        next, now);
+    }
+  return next;
+}
+
 void
 data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
 {
@@ -1011,6 +1052,8 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
           return;
         }
       job = work_reserve (WORK_IN);
+      if (!job && work_count ())
+        return;
       if (!job)
         job = &j;
       memset (job, 0, offsetof (WorkJob, buf));
@@ -1125,7 +1168,28 @@ hs_worker (void *arg)
 int
 data_hs_start (Dev *d)
 {
-  return pthread_create (&d->hs_thread, NULL, hs_worker, d) ? -1 : 0;
+  long n = sysconf (_SC_NPROCESSORS_ONLN);
+  if (n < 1)
+    n = 1;
+  d->hs_thread_n = (unsigned)n;
+  d->hs_thread = calloc (d->hs_thread_n, sizeof (*d->hs_thread));
+  if (!d->hs_thread)
+    return -1;
+  for (unsigned i = 0; i < d->hs_thread_n; i++)
+    if (pthread_create (&d->hs_thread[i], NULL, hs_worker, d))
+      {
+        pthread_mutex_lock (&d->hs_lock);
+        d->hs_stop = true;
+        pthread_cond_broadcast (&d->hs_ready);
+        pthread_mutex_unlock (&d->hs_lock);
+        while (i)
+          pthread_join (d->hs_thread[--i], NULL);
+        free (d->hs_thread);
+        d->hs_thread = NULL;
+        d->hs_thread_n = 0;
+        return -1;
+      }
+  return 0;
 }
 
 void
@@ -1142,9 +1206,13 @@ data_hs_free (Dev *d)
 {
   pthread_mutex_lock (&d->hs_lock);
   d->hs_stop = true;
-  pthread_cond_signal (&d->hs_ready);
+  pthread_cond_broadcast (&d->hs_ready);
   pthread_mutex_unlock (&d->hs_lock);
-  pthread_join (d->hs_thread, NULL);
+  for (unsigned i = 0; i < d->hs_thread_n; i++)
+    pthread_join (d->hs_thread[i], NULL);
+  free (d->hs_thread);
+  d->hs_thread = NULL;
+  d->hs_thread_n = 0;
   hs_rate_prune (d, UINT64_MAX);
 }
 

@@ -68,6 +68,7 @@ dev_peer_reset (Dev *d, Peer *p)
   p->hs_start = 0;
   p->hs_next = 0;
   p->hs_last_sent = 0;
+  p->rekey_due = 0;
   p->last_init_ms = 0;
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;

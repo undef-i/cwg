@@ -256,12 +256,15 @@ set_run (Dev *d, FILE *f)
       if (rc)
         break;
     }
-  if (!rc && awg_validate (&staged) < 0)
-    rc = -EINVAL;
   if (!rc)
     {
-      awg_merge (&d->awg, &staged);
-      peer_done (d, &sp);
+      if (awg_validate (&staged) < 0)
+        rc = -EINVAL;
+      else
+        {
+          awg_merge (&d->awg, &staged);
+          peer_done (d, &sp);
+        }
     }
   free (line);
   return rc;

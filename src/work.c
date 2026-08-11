@@ -12,7 +12,7 @@
 
 enum
 {
-  SLOT_N = 1024,
+  SLOT_N = 2048,
   SLOT_PER_TYPE = SLOT_N / 2,
   BATCH_N = 16,
   SLOT_RESERVED,
