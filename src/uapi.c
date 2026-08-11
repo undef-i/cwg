@@ -305,22 +305,23 @@ get_run (Dev *d, FILE *f)
   if (d->awg.jmax)
     fprintf (f, "jmax=%u\n", d->awg.jmax);
   for (unsigned i = 0; i < AWG_TYPE_N; i++)
+    if (d->awg.s[i])
+      fprintf (f, "s%u=%u\n", i + 1U, d->awg.s[i]);
+  for (unsigned i = 0; i < AWG_TYPE_N; i++)
     {
       char range[32];
-      if (d->awg.s[i])
-        fprintf (f, "s%u=%u\n", i + 1U, d->awg.s[i]);
       if (d->awg.h[i].lo || d->awg.h[i].hi)
         fprintf (f, "h%u=%s\n", i + 1U,
                  awg_range_get (&d->awg.h[i], range));
     }
+  for (unsigned i = 0; i < 5; i++)
+    if (d->awg.i[i])
+      fprintf (f, "i%u=%s\n", i + 1U, d->awg.i[i]);
   if (d->awg.hp)
     {
       key_hex (hex, d->awg.hp_key);
       fprintf (f, "header_protection_key=%s\n", hex);
     }
-  for (unsigned i = 0; i < 5; i++)
-    if (d->awg.i[i])
-      fprintf (f, "i%u=%s\n", i + 1U, d->awg.i[i]);
   if (d->awg.content_pad.lo || d->awg.content_pad.hi)
     {
       char range[32];
