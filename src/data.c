@@ -157,6 +157,13 @@ roam (Peer *p, const Ep *ep)
     p->ep[0] = '\0';
 }
 
+static void
+clear_src (Peer *p)
+{
+  p->addr.src_len = 0;
+  p->addr.ifindex = 0;
+}
+
 static uint64_t
 mono (void)
 {
@@ -201,7 +208,7 @@ hs_rate_key (uint8_t key[17], const Ep *ep)
     {
       key[0] = AF_INET6;
       memcpy (key + 1, &((const struct sockaddr_in6 *)&ep->sa)->sin6_addr,
-              16);
+              8);
       return true;
     }
   return false;
@@ -231,7 +238,7 @@ hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
   rate->last = now;
   if (rate->tokens > BURST_MS)
     rate->tokens = BURST_MS;
-  if (rate->tokens > RATE_MS)
+  if (rate->tokens >= RATE_MS)
     {
       rate->tokens -= RATE_MS;
       return true;
@@ -366,7 +373,15 @@ kp_set (Dev *d, Peer *p, bool initiator)
   k.initiator = initiator;
   k.ok = true;
   if (initiator)
-    kp_move (d, &p->prev, &p->kp);
+    {
+      if (p->pending.ok)
+        {
+          kp_move (d, &p->prev, &p->pending);
+          kp_drop (d, &p->kp);
+        }
+      else
+        kp_move (d, &p->prev, &p->kp);
+    }
   kp_drop (d, dst);
   *dst = k;
   e->ptr = dst;
@@ -483,6 +498,8 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
                            now + new_handshake_ms (d)
                                + randombytes_uniform (RETRY_JITTER_MS),
                            memory_order_relaxed);
+  if (p->kp.initiator && p->rekey_due && now >= p->rekey_due)
+    atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
   pka_arm (p, now);
   if (cnt >= rekey_msg_limit)
     init_send (d, p, false);
@@ -769,7 +786,8 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   p->hs_attempts = 0;
   p->hs_max_attempts = 0;
   p->rekey_sent = false;
-  data_send (d, p, NULL, 0);
+  if (!p->qn)
+    data_send (d, p, NULL, 0);
   flush (d, p);
 }
 
@@ -953,10 +971,9 @@ data_tick (Dev *d, uint64_t now)
     else if (p->hs_pending && now >= p->hs_next)
       {
         p->hs_attempts++;
+        clear_src (p);
         init_send (d, p, true);
       }
-    else if (!p->hs_pending && p->rekey_due && now >= p->rekey_due)
-      init_send (d, p, false);
     uint64_t due = atomic_load_explicit (&p->ka_due, memory_order_relaxed);
     if (due && now >= due)
       {
@@ -976,6 +993,7 @@ data_tick (Dev *d, uint64_t now)
     if (handshake_due && now >= handshake_due && !p->hs_pending)
       {
         atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
+        clear_src (p);
         init_send (d, p, false);
       }
     uint64_t pka = atomic_load_explicit (&p->pka_due, memory_order_relaxed);
@@ -1007,7 +1025,7 @@ data_next_due (Dev *d, uint64_t unused)
   (void)unused;
   HASH_ITER (hh, d->peer, p, tmp)
     {
-      next = due_min (p->hs_pending ? p->hs_next : p->rekey_due, next);
+      next = due_min (p->hs_pending ? p->hs_next : 0, next);
       next = due_min (atomic_load_explicit (&p->ka_due, memory_order_relaxed),
                       next);
       next = due_min (atomic_load_explicit (&p->pka_due, memory_order_relaxed),
@@ -1264,7 +1282,9 @@ data_commit (WorkJob *j)
                   &p->hs_due,
                   now + new_handshake_ms (d)
                        + randombytes_uniform (RETRY_JITTER_MS),
-                   memory_order_relaxed);
+                  memory_order_relaxed);
+          if (p->kp.initiator && p->rekey_due && now >= p->rekey_due)
+            atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
           pka_arm (p, now);
           if (j->cnt >= rekey_msg_limit)
             atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);

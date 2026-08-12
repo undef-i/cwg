@@ -185,10 +185,12 @@ loop_run (Dev *head, int ctl)
             next = due;
         }
       struct itimerspec its = { 0 };
-      uint64_t wait = next ? (next > now ? next - now : 1U) : 1000U;
-      its.it_value.tv_sec = (time_t)(wait / 1000U);
-      its.it_value.tv_nsec = (long)(wait % 1000U) * 1000000L;
-      if (timerfd_settime (timer, 0, &its, NULL) < 0)
+      if (next)
+        {
+          its.it_value.tv_sec = (time_t)(next / 1000U);
+          its.it_value.tv_nsec = (long)(next % 1000U) * 1000000L;
+        }
+      if (timerfd_settime (timer, TFD_TIMER_ABSTIME, &its, NULL) < 0)
         goto fail;
       int n = epoll_wait (ep, arr, 64, -1);
       if (n < 0)

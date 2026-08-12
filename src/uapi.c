@@ -164,6 +164,7 @@ peer_set (Dev *d, SetPeer *sp, const char *key, const char *val)
       if (!key_get (psk, val))
         return -EINVAL;
       memcpy (sp->p->psk, psk, sizeof (psk));
+      memcpy (sp->p->hs.psk, psk, sizeof (psk));
       sodium_memzero (psk, sizeof (psk));
     }
   else if (!strcmp (key, "endpoint"))
