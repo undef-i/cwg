@@ -1116,12 +1116,15 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
       pthread_mutex_unlock (&d->data_lock);
       if (job == &j)
         {
+          pthread_rwlock_unlock (&d->lock);
           data_work (&j);
           data_commit (&j);
         }
       else
-        work_submit (job);
-      pthread_rwlock_unlock (&d->lock);
+        {
+          work_submit (job);
+          pthread_rwlock_unlock (&d->lock);
+        }
       return;
     }
   if ((type == AWG_INIT && len != sizeof (MsgInit))
