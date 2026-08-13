@@ -334,7 +334,6 @@ dev_up (Dev *d, bool up)
       work_drain ();
       data_hs_drain (d);
       pthread_rwlock_wrlock (&d->lock);
-      HASH_ITER (hh, d->peer, p, tmp) dev_peer_reset (d, p);
       udp_close (d->udp4, d->udp6);
       udp_close (d->udp_old4, d->udp_old6);
       d->udp4 = d->udp6 = -1;

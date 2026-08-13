@@ -681,9 +681,9 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
   work_release (job, WORK_OUT);
   if (out_job (d, p, buf, len, &j))
     {
+      pthread_rwlock_unlock (&d->lock);
       data_work (&j);
       data_commit (&j);
-      pthread_rwlock_unlock (&d->lock);
       return;
     }
   pthread_rwlock_unlock (&d->lock);

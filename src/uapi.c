@@ -330,6 +330,7 @@ get_run (Dev *d, FILE *f)
       }
   HASH_ITER (hh, d->peer, p, tmp)
   {
+    pthread_mutex_lock (&d->data_lock);
     key_hex (hex, p->pk);
     fprintf (f, "public_key=%s\n", hex);
     key_hex (hex, p->psk);
@@ -352,6 +353,7 @@ get_run (Dev *d, FILE *f)
                  awg_range_get (&p->ka, range));
       }
     aip_each (d, p, get_allowed_ip, f);
+    pthread_mutex_unlock (&d->data_lock);
   }
 }
 

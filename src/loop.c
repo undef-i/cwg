@@ -309,9 +309,10 @@ loop_run (Dev *head, int ctl)
               for (Dev *d = head; d;)
                 {
                   Dev *next = d->next;
-                  d->mtu = tun_mtu (d->name);
-                  if (dev_up (d, tun_up (d->name)) < 0)
-                    dev_del (&head, d, ep);
+                   d->mtu = tun_mtu (d->name);
+                   if (dev_up (d, tun_up (d->name)) < 0)
+                    err ("(%s) interface state update failed: %s", d->name,
+                         strerror (errno));
                   d = next;
                 }
               continue;
