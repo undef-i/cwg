@@ -97,8 +97,8 @@ dev_new (const char *name)
   d->udp6 = -1;
   d->udp_old4 = -1;
   d->udp_old6 = -1;
-  d->udp_event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
-  if (d->udp_event < 0)
+  d->loop_event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (d->loop_event < 0)
     {
       free (d);
       return NULL;
@@ -147,7 +147,7 @@ fail:
     pthread_mutex_destroy (&d->data_lock);
   if (lock_ok)
     pthread_rwlock_destroy (&d->lock);
-  close (d->udp_event);
+  close (d->loop_event);
   free (d->hs);
   free (d);
   return NULL;
@@ -206,7 +206,7 @@ dev_free (Dev *d)
   free (d->hs);
   udp_close (d->udp4, d->udp6);
   udp_close (d->udp_old4, d->udp_old6);
-  close (d->udp_event);
+  close (d->loop_event);
   awg_free (&d->awg);
   pthread_mutex_destroy (&d->data_lock);
   pthread_rwlock_destroy (&d->lock);
@@ -305,16 +305,16 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
       p->addr.ifindex = 0;
     }
   d->udp_gen++;
-  dev_udp_wake (d);
+  dev_loop_wake (d);
   return 0;
 }
 
 void
-dev_udp_wake (Dev *d)
+dev_loop_wake (Dev *d)
 {
   uint64_t one = 1;
-  if (d->udp_event >= 0)
-    (void)write (d->udp_event, &one, sizeof (one));
+  if (d->loop_event >= 0)
+    (void)write (d->loop_event, &one, sizeof (one));
 }
 
 int
@@ -339,7 +339,7 @@ dev_up (Dev *d, bool up)
       d->udp4 = d->udp6 = -1;
       d->udp_old4 = d->udp_old6 = -1;
       d->udp_gen++;
-      dev_udp_wake (d);
+      dev_loop_wake (d);
       pthread_rwlock_unlock (&d->lock);
       return 0;
     }

@@ -90,7 +90,7 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
       if (d->up && dev_bind (d, (uint16_t)n, d->mark) < 0)
         return errno == EADDRINUSE ? -EADDRINUSE : -EIO;
       if (d->up)
-        dev_udp_wake (d);
+        dev_loop_wake (d);
       if (!d->up)
         d->bind_port = (uint16_t)n;
     }
@@ -386,6 +386,8 @@ conn_hnd (Dev *d, int fd)
           pthread_rwlock_wrlock (&d->lock);
           rc = set_run (d, f);
           pthread_rwlock_unlock (&d->lock);
+          if (!rc)
+            dev_loop_wake (d);
         }
       else if (!strcmp (op, "get=1\n"))
         {

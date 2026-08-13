@@ -122,7 +122,7 @@ struct Dev
   int udp6;
   int udp_old4;
   int udp_old6;
-  int udp_event;
+  int loop_event;
   int mtu;
   uint64_t udp_gen;
   uint64_t udp_seen;
@@ -173,5 +173,5 @@ void dev_reap (Dev *d);
 void dev_key_set (Dev *d, const uint8_t sk[KEY_LEN]);
 void dev_peer_reset (Dev *d, Peer *p);
 int dev_bind (Dev *d, uint16_t port, uint32_t mark);
-void dev_udp_wake (Dev *d);
+void dev_loop_wake (Dev *d);
 int dev_up (Dev *d, bool up);

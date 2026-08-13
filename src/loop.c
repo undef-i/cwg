@@ -36,7 +36,7 @@ enum
   FD_TUN,
   FD_UAPI,
   FD_UDP,
-  FD_UDP_EVENT,
+  FD_LOOP_EVENT,
   FD_INOTIFY,
   FD_WORK,
   FD_LINK,
@@ -63,9 +63,9 @@ dev_fd (Dev *head, int fd, int *kind)
           *kind = FD_UDP;
           return d;
         }
-      if (d->udp_event == fd)
+      if (d->loop_event == fd)
         {
-          *kind = FD_UDP_EVENT;
+          *kind = FD_LOOP_EVENT;
           return d;
         }
     }
@@ -88,7 +88,7 @@ dev_del (Dev **head, Dev *d, int ep)
   epoll_ctl (ep, EPOLL_CTL_DEL, d->udp6, NULL);
   epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old4, NULL);
   epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old6, NULL);
-  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_event, NULL);
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->loop_event, NULL);
   uapi_close (d);
   close (d->tun);
   dbg ("(%s) del", d->name);
@@ -217,8 +217,8 @@ loop_run (Dev *head, int ctl)
           if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
             goto fail;
         }
-      ev.data.fd = d->udp_event;
-      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp_event, &ev) < 0)
+      ev.data.fd = d->loop_event;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->loop_event, &ev) < 0)
         goto fail;
       d->udp_seen = d->udp_gen;
     }
@@ -362,10 +362,10 @@ loop_run (Dev *head, int ctl)
                 }
               continue;
             }
-          if (kind == FD_UDP_EVENT)
+          if (kind == FD_LOOP_EVENT)
             {
               uint64_t value;
-              while (read (d->udp_event, &value, sizeof (value)) > 0)
+              while (read (d->loop_event, &value, sizeof (value)) > 0)
                 ;
               if (udp_sync (d, ep, &ev) < 0)
                 goto fail;
