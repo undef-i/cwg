@@ -112,17 +112,27 @@ int
 work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *))
 {
   unsigned made = 0;
+  bool lock_ok = false, ready_ok = false, drained_ok = false;
+  bool space_ok = false;
   memset (&g, 0, sizeof (g));
   g.event = -1;
-  if (pthread_mutex_init (&g.lock, NULL) || pthread_cond_init (&g.ready, NULL)
-      || pthread_cond_init (&g.drained, NULL)
-      || pthread_cond_init (&g.space, NULL))
-    return -1;
+  if (pthread_mutex_init (&g.lock, NULL))
+    goto fail;
+  lock_ok = true;
+  if (pthread_cond_init (&g.ready, NULL))
+    goto fail;
+  ready_ok = true;
+  if (pthread_cond_init (&g.drained, NULL))
+    goto fail;
+  drained_ok = true;
+  if (pthread_cond_init (&g.space, NULL))
+    goto fail;
+  space_ok = true;
   g.run = run;
   g.commit = commit;
   g.event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (g.event < 0)
-    return -1;
+    goto fail;
   g.nthread = workers_get ();
   g.free_n[WORK_OUT] = SLOT_PER_TYPE;
   g.free_n[WORK_IN] = SLOT_PER_TYPE;
@@ -142,15 +152,30 @@ work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *))
   return 0;
 
 fail:
-  pthread_mutex_lock (&g.lock);
-  g.stopping = true;
-  pthread_cond_broadcast (&g.ready);
-  pthread_mutex_unlock (&g.lock);
+  if (lock_ok)
+    {
+      pthread_mutex_lock (&g.lock);
+      g.stopping = true;
+      if (ready_ok)
+        pthread_cond_broadcast (&g.ready);
+      pthread_mutex_unlock (&g.lock);
+    }
   while (made)
     pthread_join (g.thread[--made], NULL);
   free (g.thread);
   g.thread = NULL;
   g.nthread = 0;
+  if (space_ok)
+    pthread_cond_destroy (&g.space);
+  if (drained_ok)
+    pthread_cond_destroy (&g.drained);
+  if (ready_ok)
+    pthread_cond_destroy (&g.ready);
+  if (lock_ok)
+    pthread_mutex_destroy (&g.lock);
+  if (g.event >= 0)
+    close (g.event);
+  g.event = -1;
   return -1;
 }
 

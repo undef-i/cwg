@@ -14,7 +14,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -88,9 +87,12 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
     {
       if (!u64_get (val, UINT16_MAX, &n))
         return -EINVAL;
-      d->bind_port = (uint16_t)n;
-      if (d->up && dev_bind (d, d->bind_port, d->mark) < 0)
+      if (d->up && dev_bind (d, (uint16_t)n, d->mark) < 0)
         return errno == EADDRINUSE ? -EADDRINUSE : -EIO;
+      if (d->up)
+        dev_udp_wake (d);
+      if (!d->up)
+        d->bind_port = (uint16_t)n;
     }
   else if (!strcmp (key, "fwmark"))
     {
@@ -109,28 +111,6 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
         return -EINVAL;
     }
   return 0;
-}
-
-static bool
-awg_staged (const char *key)
-{
-  return (!strcmp (key, "h1") || !strcmp (key, "h2")
-          || !strcmp (key, "h3") || !strcmp (key, "h4")
-          || !strcmp (key, "s1") || !strcmp (key, "s2")
-          || !strcmp (key, "s3") || !strcmp (key, "s4")
-          || !strcmp (key, "header_protection_key"));
-}
-
-static void
-awg_merge (Awg *dst, const Awg *src)
-{
-  for (unsigned i = 0; i < AWG_TYPE_N; i++)
-    {
-      dst->h[i] = src->h[i];
-      dst->s[i] = src->s[i];
-    }
-  memcpy (dst->hp_key, src->hp_key, sizeof (dst->hp_key));
-  dst->hp = src->hp;
 }
 
 static int
@@ -215,12 +195,14 @@ peer_done (Dev *d, SetPeer *sp)
 static int
 set_run (Dev *d, FILE *f)
 {
-  Awg staged = d->awg;
+  Awg staged;
   SetPeer sp = { 0 };
   char *line = NULL;
   size_t cap = 0;
   int rc = 0;
 
+  if (awg_clone (&staged, &d->awg) < 0)
+    return -ENOMEM;
   while (getline (&line, &cap, f) > 0)
     {
       char *eq, *val;
@@ -256,7 +238,7 @@ set_run (Dev *d, FILE *f)
             }
         }
       else if (!sp.p && !sp.dummy)
-        rc = dev_set (d, awg_staged (line) ? &staged : &d->awg, line, val);
+        rc = dev_set (d, &staged, line, val);
       else
         rc = peer_set (d, &sp, line, val);
       if (rc)
@@ -268,10 +250,13 @@ set_run (Dev *d, FILE *f)
         rc = -EINVAL;
       else
         {
-          awg_merge (&d->awg, &staged);
+          Awg old = d->awg;
+          d->awg = staged;
+          staged = old;
           peer_done (d, &sp);
         }
     }
+  awg_free (&staged);
   free (line);
   return rc;
 }
@@ -373,17 +358,27 @@ get_run (Dev *d, FILE *f)
 static void
 conn_hnd (Dev *d, int fd)
 {
-  FILE *f = fdopen (fd, "r+");
+  FILE *f = fdopen (fd, "r");
+  FILE *out;
   char *op = NULL;
-  size_t cap = 0;
+  size_t op_cap = 0;
   if (!f)
     {
       close (fd);
       return;
     }
-  while (getline (&op, &cap, f) > 0)
+  out = fdopen (dup (fd), "w");
+  if (!out)
     {
-      int rc;
+      fclose (f);
+      return;
+    }
+  for (;;)
+    {
+      ssize_t n = getline (&op, &op_cap, f);
+      if (n <= 0)
+        break;
+      int rc = -EINVAL;
       if (!strcmp (op, "set=1\n"))
         {
           pthread_rwlock_wrlock (&d->lock);
@@ -393,20 +388,38 @@ conn_hnd (Dev *d, int fd)
       else if (!strcmp (op, "get=1\n"))
         {
           int c = fgetc (f);
-          rc = c == '\n' ? 0 : -EINVAL;
-          if (!rc)
+          if (c != '\n')
+            goto bad;
+          char *reply = NULL;
+          size_t reply_len = 0;
+          FILE *snapshot = open_memstream (&reply, &reply_len);
+          if (snapshot)
             {
               pthread_rwlock_rdlock (&d->lock);
-              get_run (d, f);
+              get_run (d, snapshot);
               pthread_rwlock_unlock (&d->lock);
+              if (fclose (snapshot) == 0
+                  && fwrite (reply, 1, reply_len, out) == reply_len)
+                rc = 0;
+              free (reply);
             }
+          else
+            rc = -ENOMEM;
         }
       else
         break;
-      fprintf (f, "errno=%d\n\n", rc);
-      fflush (f);
+      fprintf (out, "errno=%d\n\n", rc);
+      if (fflush (out))
+        break;
     }
   free (op);
+  fclose (out);
+  fclose (f);
+  return;
+
+bad:
+  free (op);
+  fclose (out);
   fclose (f);
 }
 

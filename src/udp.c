@@ -6,6 +6,7 @@
 #include <netinet/ip.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -247,13 +248,25 @@ udp_close (int udp4, int udp6)
 int
 udp_mark (int udp4, int udp6, uint32_t mark)
 {
-  if (udp4 >= 0
-      && setsockopt (udp4, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) < 0)
+  int old4 = 0, old6 = 0;
+  socklen_t len4 = sizeof (old4), len6 = sizeof (old6);
+  bool set4 = false, set6 = false;
+  if (udp4 >= 0 && (getsockopt (udp4, SOL_SOCKET, SO_MARK, &old4, &len4) < 0
+                    || setsockopt (udp4, SOL_SOCKET, SO_MARK, &mark,
+                                   sizeof (mark)) < 0))
     return -1;
-  return udp6 < 0
-         || setsockopt (udp6, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) == 0
-             ? 0
-             : -1;
+  set4 = udp4 >= 0;
+  if (udp6 >= 0
+      && (getsockopt (udp6, SOL_SOCKET, SO_MARK, &old6, &len6) < 0
+          || setsockopt (udp6, SOL_SOCKET, SO_MARK, &mark, sizeof (mark)) < 0))
+    {
+      if (set4)
+        setsockopt (udp4, SOL_SOCKET, SO_MARK, &old4, sizeof (old4));
+      return -1;
+    }
+  set6 = udp6 >= 0;
+  (void)set6;
+  return 0;
 }
 
 ssize_t

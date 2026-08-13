@@ -135,16 +135,15 @@ awg_handshake_preamble (Dev *d, Peer *p)
           && awg_i_make (&d->awg, i, buf, &len, AWG_PACKET_MAX) == 0 && len)
         send_pkt (d, p, buf, len, false);
     }
-  for (uint32_t i = 0; i < d->awg.jc; i++)
-    {
-      size_t len = d->awg.jmin;
-      if (d->awg.jmax > d->awg.jmin)
-        len += randombytes_uniform (d->awg.jmax - d->awg.jmin);
-      if (len > AWG_PACKET_MAX)
-        continue;
-      randombytes_buf (buf, len);
-      send_pkt (d, p, buf, len, false);
-    }
+  if (d->awg.jc && d->awg.jmax)
+    for (uint32_t i = 0; i < d->awg.jc; i++)
+      {
+        size_t len = d->awg.jmin;
+        if (d->awg.jmax > d->awg.jmin)
+          len += randombytes_uniform (d->awg.jmax - d->awg.jmin + 1U);
+        randombytes_buf (buf, len);
+        send_pkt (d, p, buf, len, false);
+      }
   sodium_memzero (buf, AWG_PACKET_MAX);
   free (buf);
 }
@@ -227,7 +226,10 @@ hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
     {
       rate = calloc (1, sizeof (*rate));
       if (!rate)
-        return false;
+        {
+          free (rate);
+          return false;
+        }
       memcpy (rate->key, key, sizeof (key));
       rate->last = now;
       rate->tokens = BURST_MS - RATE_MS;

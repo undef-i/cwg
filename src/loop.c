@@ -36,6 +36,7 @@ enum
   FD_TUN,
   FD_UAPI,
   FD_UDP,
+  FD_UDP_EVENT,
   FD_INOTIFY,
   FD_WORK,
   FD_LINK,
@@ -62,6 +63,11 @@ dev_fd (Dev *head, int fd, int *kind)
           *kind = FD_UDP;
           return d;
         }
+      if (d->udp_event == fd)
+        {
+          *kind = FD_UDP_EVENT;
+          return d;
+        }
     }
   return NULL;
 }
@@ -80,10 +86,48 @@ dev_del (Dev **head, Dev *d, int ep)
   epoll_ctl (ep, EPOLL_CTL_DEL, d->uapi, NULL);
   epoll_ctl (ep, EPOLL_CTL_DEL, d->udp4, NULL);
   epoll_ctl (ep, EPOLL_CTL_DEL, d->udp6, NULL);
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old4, NULL);
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old6, NULL);
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_event, NULL);
   uapi_close (d);
   close (d->tun);
   dbg ("(%s) del", d->name);
   dev_free (d);
+}
+
+static int
+udp_sync (Dev *d, int ep, struct epoll_event *ev)
+{
+  int rc = 0;
+  pthread_rwlock_wrlock (&d->lock);
+  if (d->udp_seen == d->udp_gen)
+    goto out;
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old4, NULL);
+  epoll_ctl (ep, EPOLL_CTL_DEL, d->udp_old6, NULL);
+  udp_close (d->udp_old4, d->udp_old6);
+  d->udp_old4 = d->udp_old6 = -1;
+  if (d->udp4 >= 0)
+    {
+      ev->data.fd = d->udp4;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, ev) < 0)
+        {
+          rc = -1;
+          goto out;
+        }
+    }
+  if (d->udp6 >= 0)
+    {
+      ev->data.fd = d->udp6;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, ev) < 0)
+        {
+          rc = -1;
+          goto out;
+        }
+    }
+  d->udp_seen = d->udp_gen;
+out:
+  pthread_rwlock_unlock (&d->lock);
+  return rc;
 }
 
 static void
@@ -166,10 +210,16 @@ loop_run (Dev *head, int ctl)
           ev.data.fd = d->udp4;
           if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
             goto fail;
+        }
+      if (d->udp6 >= 0)
+        {
           ev.data.fd = d->udp6;
           if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
             goto fail;
         }
+      ev.data.fd = d->udp_event;
+      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp_event, &ev) < 0)
+        goto fail;
       d->udp_seen = d->udp_gen;
     }
 
@@ -285,19 +335,8 @@ loop_run (Dev *head, int ctl)
             {
               if (uapi_hnd (d) < 0)
                 dev_del (&head, d, ep);
-              else if (d->udp_seen != d->udp_gen)
-                {
-                  if (d->udp4 >= 0)
-                    {
-                      ev.data.fd = d->udp4;
-                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
-                        goto fail;
-                      ev.data.fd = d->udp6;
-                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
-                        goto fail;
-                    }
-                  d->udp_seen = d->udp_gen;
-                }
+              else if (udp_sync (d, ep, &ev) < 0)
+                goto fail;
               continue;
             }
           if (kind == FD_UDP)
@@ -320,6 +359,15 @@ loop_run (Dev *head, int ctl)
                     continue;
                   break;
                 }
+              continue;
+            }
+          if (kind == FD_UDP_EVENT)
+            {
+              uint64_t value;
+              while (read (d->udp_event, &value, sizeof (value)) > 0)
+                ;
+              if (udp_sync (d, ep, &ev) < 0)
+                goto fail;
               continue;
             }
           if (arr[i].events & (EPOLLERR | EPOLLHUP))
@@ -351,23 +399,12 @@ loop_run (Dev *head, int ctl)
             dev_del (&head, d, ep);
           else
             {
-              if (d->udp_seen != d->udp_gen)
-                {
-                  if (d->udp4 >= 0)
-                    {
-                      ev.data.fd = d->udp4;
-                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
-                        goto fail;
-                      ev.data.fd = d->udp6;
-                      if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
-                        goto fail;
-                    }
-                  d->udp_seen = d->udp_gen;
-                }
+                if (udp_sync (d, ep, &ev) < 0)
+                  goto fail;
               pthread_rwlock_wrlock (&d->lock);
               data_tick (d, now);
-              pthread_rwlock_unlock (&d->lock);
               dev_reap (d);
+              pthread_rwlock_unlock (&d->lock);
             }
           d = next;
         }

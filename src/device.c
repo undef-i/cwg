@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 static uint64_t
 mono (void)
@@ -82,6 +84,9 @@ dev_peer_reset (Dev *d, Peer *p)
 Dev *
 dev_new (const char *name)
 {
+  bool lock_ok = false, data_ok = false, hs_lock_ok = false;
+  bool hs_ready_ok = false, hs_idle_ok = false, uapi_ok = false;
+  bool uapi_idle_ok = false;
   Dev *d = calloc (1, sizeof (*d));
   if (!d)
     return NULL;
@@ -90,23 +95,62 @@ dev_new (const char *name)
   d->uapi = -1;
   d->udp4 = -1;
   d->udp6 = -1;
-  awg_init (&d->awg);
-  d->hs = calloc (HS_QUEUE_CAP, sizeof (*d->hs));
-  if (!d->hs || pthread_rwlock_init (&d->lock, NULL)
-      || pthread_mutex_init (&d->data_lock, NULL)
-      || pthread_mutex_init (&d->hs_lock, NULL)
-      || pthread_cond_init (&d->hs_ready, NULL)
-      || pthread_cond_init (&d->hs_idle, NULL)
-      || pthread_mutex_init (&d->uapi_lock, NULL)
-      || pthread_cond_init (&d->uapi_idle, NULL) || data_hs_start (d) < 0)
+  d->udp_old4 = -1;
+  d->udp_old6 = -1;
+  d->udp_event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (d->udp_event < 0)
     {
-      free (d->hs);
       free (d);
       return NULL;
     }
+  awg_init (&d->awg);
+  d->hs = calloc (HS_QUEUE_CAP, sizeof (*d->hs));
+  if (!d->hs || pthread_rwlock_init (&d->lock, NULL))
+    goto fail;
+  lock_ok = true;
+  if (pthread_mutex_init (&d->data_lock, NULL))
+    goto fail;
+  data_ok = true;
+  if (pthread_mutex_init (&d->hs_lock, NULL))
+    goto fail;
+  hs_lock_ok = true;
+  if (pthread_cond_init (&d->hs_ready, NULL))
+    goto fail;
+  hs_ready_ok = true;
+  if (pthread_cond_init (&d->hs_idle, NULL))
+    goto fail;
+  hs_idle_ok = true;
+  if (pthread_mutex_init (&d->uapi_lock, NULL))
+    goto fail;
+  uapi_ok = true;
+  if (pthread_cond_init (&d->uapi_idle, NULL))
+    goto fail;
+  uapi_idle_ok = true;
+  if (data_hs_start (d) < 0)
+    goto fail;
   randombytes_buf (d->cookie_secret, sizeof (d->cookie_secret));
   d->cookie_birth = mono ();
   return d;
+
+fail:
+  if (uapi_idle_ok)
+    pthread_cond_destroy (&d->uapi_idle);
+  if (uapi_ok)
+    pthread_mutex_destroy (&d->uapi_lock);
+  if (hs_idle_ok)
+    pthread_cond_destroy (&d->hs_idle);
+  if (hs_ready_ok)
+    pthread_cond_destroy (&d->hs_ready);
+  if (hs_lock_ok)
+    pthread_mutex_destroy (&d->hs_lock);
+  if (data_ok)
+    pthread_mutex_destroy (&d->data_lock);
+  if (lock_ok)
+    pthread_rwlock_destroy (&d->lock);
+  close (d->udp_event);
+  free (d->hs);
+  free (d);
+  return NULL;
 }
 
 void
@@ -147,9 +191,9 @@ dev_peer_clr (Dev *d)
 void
 dev_free (Dev *d)
 {
+  uapi_drain (d);
   work_drain ();
   data_hs_free (d);
-  uapi_drain (d);
   dev_peer_clr (d);
   dev_reap (d);
   aip_free (d);
@@ -161,6 +205,8 @@ dev_free (Dev *d)
   pthread_mutex_destroy (&d->uapi_lock);
   free (d->hs);
   udp_close (d->udp4, d->udp6);
+  udp_close (d->udp_old4, d->udp_old6);
+  close (d->udp_event);
   awg_free (&d->awg);
   pthread_mutex_destroy (&d->data_lock);
   pthread_rwlock_destroy (&d->lock);
@@ -239,7 +285,14 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
       errno = e;
       return -1;
     }
-  udp_close (d->udp4, d->udp6);
+  if (d->udp_old4 >= 0 || d->udp_old6 >= 0)
+    {
+      udp_close (fd4, fd6);
+      errno = EBUSY;
+      return -1;
+    }
+  d->udp_old4 = d->udp4;
+  d->udp_old6 = d->udp6;
   d->udp4 = fd4;
   d->udp6 = fd6;
   d->port = actual;
@@ -252,31 +305,54 @@ dev_bind (Dev *d, uint16_t port, uint32_t mark)
       p->addr.ifindex = 0;
     }
   d->udp_gen++;
+  dev_udp_wake (d);
   return 0;
+}
+
+void
+dev_udp_wake (Dev *d)
+{
+  uint64_t one = 1;
+  if (d->udp_event >= 0)
+    (void)write (d->udp_event, &one, sizeof (one));
 }
 
 int
 dev_up (Dev *d, bool up)
 {
   Peer *p, *tmp;
+  pthread_rwlock_wrlock (&d->lock);
   if (d->up == up)
-    return 0;
+    {
+      pthread_rwlock_unlock (&d->lock);
+      return 0;
+    }
   if (!up)
     {
+      d->up = false;
+      pthread_rwlock_unlock (&d->lock);
       work_drain ();
       data_hs_drain (d);
+      pthread_rwlock_wrlock (&d->lock);
       HASH_ITER (hh, d->peer, p, tmp) dev_peer_reset (d, p);
-      d->up = false;
       udp_close (d->udp4, d->udp6);
+      udp_close (d->udp_old4, d->udp_old6);
       d->udp4 = d->udp6 = -1;
+      d->udp_old4 = d->udp_old6 = -1;
       d->udp_gen++;
+      dev_udp_wake (d);
+      pthread_rwlock_unlock (&d->lock);
       return 0;
     }
   if (dev_bind (d, d->bind_port, d->mark) < 0)
-    return -1;
+    {
+      pthread_rwlock_unlock (&d->lock);
+      return -1;
+    }
   d->up = true;
   HASH_ITER (hh, d->peer, p, tmp)
     if (p->ka.lo || p->ka.hi)
       data_keepalive (d, p);
+  pthread_rwlock_unlock (&d->lock);
   return 0;
 }

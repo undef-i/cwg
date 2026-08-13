@@ -50,7 +50,31 @@ void
 awg_free (Awg *a)
 {
   for (unsigned i = 0; i < 5; i++)
-    free (a->i[i]);
+    {
+      free (a->i[i]);
+      a->i[i] = NULL;
+    }
+}
+
+int
+awg_clone (Awg *dst, const Awg *src)
+{
+  memset (dst, 0, sizeof (*dst));
+  memcpy (dst, src, sizeof (*dst));
+  memset (dst->i, 0, sizeof (dst->i));
+  for (unsigned i = 0; i < 5; i++)
+    {
+      if (src->i[i])
+        {
+          dst->i[i] = strdup (src->i[i]);
+          if (!dst->i[i])
+            {
+              awg_free (dst);
+              return -ENOMEM;
+            }
+        }
+    }
+  return 0;
 }
 
 int
@@ -127,7 +151,7 @@ awg_set (Awg *a, const char *key, const char *value)
   if (!strcmp (key, "jc") || !strcmp (key, "jmin") || !strcmp (key, "jmax"))
     {
        uint64_t v;
-       if (!u64_get (value, UINT32_MAX, &v))
+      if (!u64_get (value, UINT16_MAX, &v))
         return -EINVAL;
       if (!strcmp (key, "jc"))
         {
@@ -183,7 +207,7 @@ awg_set (Awg *a, const char *key, const char *value)
           free (spec);
           return -ENOMEM;
         }
-      Awg copy = *a;
+       Awg copy = *a;
       copy.i[key[1] - '1'] = spec;
       if (awg_i_make (&copy, key[1] - '1', check, &len, AWG_PACKET_MAX) < 0)
         {
@@ -227,6 +251,9 @@ awg_validate (const Awg *a)
     for (unsigned i = 0; i < AWG_TYPE_N; i++)
       if (a->s[i] < 12U)
         return -EINVAL;
+  if ((a->jc && (!a->jmin || !a->jmax || a->jc > 128U
+                 || a->jmin >= a->jmax || a->jmax > 1280U)))
+    return -EINVAL;
   return 0;
 }
 

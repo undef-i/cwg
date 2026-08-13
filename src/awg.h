@@ -38,6 +38,7 @@ typedef struct
 
 void awg_init (Awg *a);
 void awg_free (Awg *a);
+int awg_clone (Awg *dst, const Awg *src);
 int awg_range_set (AwgRange *r, const char *value);
 int awg_hex_set (uint8_t *out, size_t *out_len, const char *value);
 int awg_set (Awg *a, const char *key, const char *value);

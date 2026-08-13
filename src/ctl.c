@@ -69,10 +69,16 @@ dev_add (Dev **head, int ep, const char *name, const char *socket_dir)
       ev.data.fd = d->udp4;
       if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp4, &ev) < 0)
         goto fail;
+    }
+  if (d->udp6 >= 0)
+    {
       ev.data.fd = d->udp6;
       if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp6, &ev) < 0)
         goto fail;
     }
+  ev.data.fd = d->udp_event;
+  if (epoll_ctl (ep, EPOLL_CTL_ADD, d->udp_event, &ev) < 0)
+    goto fail;
   d->udp_seen = d->udp_gen;
   d->next = *head;
   *head = d;

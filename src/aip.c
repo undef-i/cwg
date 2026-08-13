@@ -55,19 +55,41 @@ aip_add (Dev *d, Peer *p, int af, const uint8_t ip[16], uint8_t cidr)
 {
   AipNode **root = aip_root (d, af);
   AipNode *node;
+  AipNode **created_link[129];
+  AipNode *created[129];
+  unsigned created_n = 0;
   size_t bits = af_len (af) * 8U;
 
   if (!root || cidr > bits)
     return -EINVAL;
-  if (!*root && !(*root = calloc (1, sizeof (**root))))
-    return -ENOMEM;
+  if (!*root)
+    {
+      *root = calloc (1, sizeof (**root));
+      if (!*root)
+        return -ENOMEM;
+      created_link[created_n] = root;
+      created[created_n++] = *root;
+    }
   node = *root;
   for (unsigned bit = 0; bit < cidr; bit++)
     {
       unsigned side = ip_bit (ip, bit);
-      if (!node->child[side]
-          && !(node->child[side] = calloc (1, sizeof (*node))))
-        return -ENOMEM;
+      bool made = !node->child[side];
+      if (made && !(node->child[side] = calloc (1, sizeof (*node))))
+        {
+          while (created_n)
+            {
+              AipNode *child = created[--created_n];
+              *created_link[created_n] = NULL;
+              free (child);
+            }
+          return -ENOMEM;
+        }
+      if (made)
+        {
+          created_link[created_n] = &node->child[side];
+          created[created_n++] = node->child[side];
+        }
       node = node->child[side];
     }
   node->peer = p;
