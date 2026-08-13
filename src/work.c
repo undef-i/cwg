@@ -57,7 +57,7 @@ workers_get (void)
     {
       errno = 0;
       v = strtoul (s, &end, 10);
-      if (!errno && !*end && v <= 256U)
+      if (!errno && !*end && v > 0 && v <= 256U)
         return (unsigned)v;
     }
   if (n < 1)
@@ -141,8 +141,6 @@ work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *))
       g.freeq[WORK_OUT][i] = i;
       g.freeq[WORK_IN][i] = SLOT_PER_TYPE + i;
     }
-  if (!g.nthread)
-    return 0;
   g.thread = calloc (g.nthread, sizeof (*g.thread));
   if (!g.thread)
     goto fail;
