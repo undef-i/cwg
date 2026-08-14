@@ -105,7 +105,8 @@ dev_new (const char *name)
     }
   awg_init (&d->awg);
   d->hs = calloc (HS_QUEUE_CAP, sizeof (*d->hs));
-  if (!d->hs || pthread_rwlock_init (&d->lock, NULL))
+  d->gro_buf = malloc (PKT_MAX);
+  if (!d->hs || !d->gro_buf || pthread_rwlock_init (&d->lock, NULL))
     goto fail;
   lock_ok = true;
   if (pthread_mutex_init (&d->data_lock, NULL))
@@ -149,6 +150,7 @@ fail:
     pthread_rwlock_destroy (&d->lock);
   close (d->loop_event);
   free (d->hs);
+  free (d->gro_buf);
   free (d);
   return NULL;
 }
@@ -204,6 +206,7 @@ dev_free (Dev *d)
   pthread_cond_destroy (&d->uapi_idle);
   pthread_mutex_destroy (&d->uapi_lock);
   free (d->hs);
+  free (d->gro_buf);
   udp_close (d->udp4, d->udp6);
   udp_close (d->udp_old4, d->udp_old6);
   close (d->loop_event);

@@ -137,21 +137,30 @@ dev_all_del (Dev **head, int ep)
     dev_del (head, *head, ep);
 }
 
+static bool
+tun_packet (void *arg, const uint8_t *buf, size_t len)
+{
+  data_tun (arg, buf, len);
+  return true;
+}
+
 int
 loop_run (Dev *head, int ctl)
 {
   struct epoll_event ev, arr[64];
-  uint8_t *buf = malloc (PKT_MAX);
+  uint8_t *buf = malloc (PKT_MAX + TUN_VNET_HDR_LEN);
+  uint8_t *gso = malloc (PKT_MAX);
   UdpPacket *pkt = calloc (UDP_BATCH_MAX, sizeof (*pkt));
   int ep = epoll_create1 (EPOLL_CLOEXEC);
   int ino = inotify_init1 (IN_CLOEXEC | IN_NONBLOCK);
   int link = tun_watch_open ();
   int timer = timerfd_create (CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
   int wg_watch = -1, awg_watch = -1;
-  if (ep < 0 || ino < 0 || link < 0 || timer < 0 || !buf || !pkt)
+  if (ep < 0 || ino < 0 || link < 0 || timer < 0 || !buf || !gso || !pkt)
     {
       free (pkt);
       free (buf);
+      free (gso);
       if (ep >= 0)
         close (ep);
       if (ino >= 0)
@@ -170,6 +179,7 @@ loop_run (Dev *head, int ctl)
       close (timer);
       free (pkt);
       free (buf);
+      free (gso);
       return -1;
     }
 
@@ -378,10 +388,14 @@ loop_run (Dev *head, int ctl)
             }
           for (;;)
             {
-              ssize_t nr = tun_read (d->tun, buf, PKT_MAX);
+              ssize_t nr = tun_read (d->tun, buf, PKT_MAX + TUN_VNET_HDR_LEN);
               if (nr > 0)
                 {
-                  data_tun (d, buf, (size_t)nr);
+                  if (d->tun_vnet)
+                    (void)tun_gso_split (buf, (size_t)nr, gso, PKT_MAX,
+                                          tun_packet, d);
+                  else
+                    data_tun (d, buf, (size_t)nr);
                   continue;
                 }
               if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -407,6 +421,7 @@ loop_run (Dev *head, int ctl)
               dev_reap (d);
               pthread_rwlock_unlock (&d->lock);
             }
+          data_gro_flush (d);
           d = next;
         }
     }
@@ -418,6 +433,7 @@ loop_run (Dev *head, int ctl)
   close (ep);
   free (pkt);
   free (buf);
+  free (gso);
   return 0;
 
 fail:
@@ -429,5 +445,6 @@ fail:
   close (ep);
   free (pkt);
   free (buf);
+  free (gso);
   return -1;
 }

@@ -196,7 +196,8 @@ main (int argc, char **argv)
   if (!d)
     return 1;
   snprintf (d->socket_dir, sizeof (d->socket_dir), "%s", socket_dir);
-  d->tun = has_tun_fd > 0 ? tun_adopt (tun_fd, name) : tun_open (name);
+  d->tun = has_tun_fd > 0 ? tun_adopt (tun_fd, name, &d->tun_vnet)
+                           : tun_open (name, &d->tun_vnet);
   if (d->tun < 0)
     {
       err ("%s: tun: %s", name, strerror (errno));

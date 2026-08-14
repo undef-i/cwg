@@ -14,3 +14,4 @@ uint64_t data_next_due (Dev *d, uint64_t now);
 uint64_t data_now (void);
 void data_work (WorkJob *j);
 void data_commit (WorkJob *j);
+void data_gro_flush (Dev *d);

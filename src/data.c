@@ -508,6 +508,63 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
   return true;
 }
 
+void
+data_gro_flush (Dev *d)
+{
+  if (!d->gro_len)
+    return;
+  if (tun_write_gso (d->tun, d->tun_vnet, d->gro_buf, d->gro_len,
+                     d->gro_size)
+      != (ssize_t)d->gro_len)
+    err ("(%s) tun write: %s", d->name, strerror (errno));
+  d->gro_len = 0;
+  d->gro_size = 0;
+}
+
+static bool
+gro_candidate (const uint8_t *buf, size_t len)
+{
+  size_t ip_len;
+  if (len < 40 || ((buf[0] >> 4) != 4 && (buf[0] >> 4) != 6))
+    return false;
+  ip_len = (buf[0] >> 4) == 6 ? 40U : (size_t)(buf[0] & 15U) * 4U;
+  uint8_t proto = buf[(buf[0] >> 4) == 6 ? 6 : 9];
+  return ip_len >= 20
+         && ((proto == IPPROTO_TCP && ip_len + 20 <= len
+              && (buf[ip_len + 12] >> 4) * 4U >= 20)
+             || (proto == IPPROTO_UDP && ip_len + 8 <= len));
+}
+
+static void
+gro_write (Dev *d, const uint8_t *buf, size_t len)
+{
+  size_t old_len;
+  int gso_size;
+  if (!d->tun_vnet || !gro_candidate (buf, len))
+    {
+      data_gro_flush (d);
+      if (tun_write (d->tun, d->tun_vnet, buf, len) != (ssize_t)len)
+        err ("(%s) tun write: %s", d->name, strerror (errno));
+      return;
+    }
+  if (d->gro_len)
+    {
+      old_len = d->gro_len;
+      gso_size = d->gro_buf[(d->gro_buf[0] >> 4) == 6 ? 6 : 9] == IPPROTO_TCP
+                     ? tun_gro_tcp (d->gro_buf, &d->gro_len, buf, len)
+                     : tun_gro_udp (d->gro_buf, &d->gro_len, buf, len);
+      if (gso_size > 0)
+        {
+          d->gro_size = (uint16_t)gso_size;
+          return;
+        }
+      d->gro_len = old_len;
+      data_gro_flush (d);
+    }
+  memcpy (d->gro_buf, buf, len);
+  d->gro_len = len;
+}
+
 static bool
 out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
 {
@@ -920,8 +977,7 @@ data_get (Dev *d, const Ep *src, const uint8_t *buf, size_t len)
     return;
   if (iplen > n || aip_fnd (d, af, sip) != p)
     return;
-  if (tun_write (d->tun, plain, iplen) != (ssize_t)iplen)
-    err ("(%s) tun write: %s", d->name, strerror (errno));
+  gro_write (d, plain, iplen);
 }
 
 void
@@ -1357,8 +1413,7 @@ data_commit (WorkJob *j)
       if (iplen <= j->len && aip_fnd (d, af, sip) == p)
         {
           pka_arm (p, now);
-          if (tun_write (d->tun, j->buf, iplen) != (ssize_t)iplen)
-            err ("(%s) tun write: %s", d->name, strerror (errno));
+          gro_write (d, j->buf, iplen);
         }
     }
 out:
