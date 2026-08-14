@@ -87,7 +87,8 @@ dev_set (Dev *d, Awg *awg, const char *key, const char *val)
     {
       if (!u64_get (val, UINT16_MAX, &n))
         return -EINVAL;
-      if (d->up && dev_bind (d, (uint16_t)n, d->mark) < 0)
+      if (d->up && (uint16_t)n != d->bind_port
+          && dev_bind (d, (uint16_t)n, d->mark) < 0)
         return errno == EADDRINUSE ? -EADDRINUSE : -EIO;
       if (d->up)
         dev_loop_wake (d);
