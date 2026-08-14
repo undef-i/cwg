@@ -30,6 +30,7 @@ typedef struct
 
 bool noise_init (Noise *n, const uint8_t sk[32], const uint8_t rpk[32],
                  const uint8_t psk[32]);
+void tai64n_stamp (uint8_t out[12], uint64_t sec, uint32_t ns);
 bool noise_init_make (Noise *n, MsgInit *m, uint32_t idx);
 bool noise_init_get (Noise *n, const MsgInit *m);
 bool noise_resp_make (Noise *n, MsgResp *m, uint32_t idx);

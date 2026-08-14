@@ -28,17 +28,21 @@ start (Noise *n, const uint8_t rpk[32])
   mix_hash (n->h, rpk, 32);
 }
 
+void
+tai64n_stamp (uint8_t out[12], uint64_t sec, uint32_t ns)
+{
+  sec = htobe64 (0x400000000000000aULL + sec);
+  ns = htobe32 (ns & ~UINT32_C (0x00ffffff));
+  memcpy (out, &sec, 8);
+  memcpy (out + 8, &ns, 4);
+}
+
 static void
 tai (uint8_t out[12])
 {
   struct timespec ts;
-  uint64_t sec;
-  uint32_t ns;
   clock_gettime (CLOCK_REALTIME, &ts);
-  sec = htobe64 (0x400000000000000aULL + (uint64_t)ts.tv_sec);
-  ns = htobe32 ((uint32_t)ts.tv_nsec);
-  memcpy (out, &sec, 8);
-  memcpy (out + 8, &ns, 4);
+  tai64n_stamp (out, (uint64_t)ts.tv_sec, (uint32_t)ts.tv_nsec);
 }
 
 static bool
