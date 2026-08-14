@@ -87,7 +87,7 @@ jobs:
           tag="latest"
           gh release delete "$tag" --repo "$repo" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" --repo "$repo" artifacts/*.tar.gz \
-            --title "latest (rolling)" \
+            --title "latest" \
             --notes "" \
             --target "$GITHUB_SHA"
           gh release view "$tag" --repo "$repo" --json tagName,url
