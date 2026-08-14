@@ -23,17 +23,27 @@ hash2 (uint8_t out[HASH_LEN], const void *a, size_t alen, const void *b,
 }
 
 void
-mac (uint8_t out[HASH_LEN], const uint8_t key[HASH_LEN], const void *in,
-     size_t len)
+mac (uint8_t out[HASH_LEN], const uint8_t key[HASH_LEN], size_t key_len,
+     const void *in, size_t len)
 {
-  uint8_t ipad[64], opad[64], inner[HASH_LEN];
+  uint8_t ipad[64], opad[64], inner[HASH_LEN], k[64];
   blake2s_state s;
   memset (ipad, 0x36, sizeof (ipad));
   memset (opad, 0x5c, sizeof (opad));
-  for (size_t i = 0; i < HASH_LEN; i++)
+  if (key_len > sizeof (k))
     {
-      ipad[i] ^= key[i];
-      opad[i] ^= key[i];
+      hash (k, key, key_len);
+      key_len = HASH_LEN;
+    }
+  else
+    {
+      memcpy (k, key, key_len);
+      memset (k + key_len, 0, sizeof (k) - key_len);
+    }
+  for (size_t i = 0; i < sizeof (k); i++)
+    {
+      ipad[i] ^= k[i];
+      opad[i] ^= k[i];
     }
   blake2s_init (&s, HASH_LEN);
   blake2s_update (&s, ipad, sizeof (ipad));
@@ -46,49 +56,50 @@ mac (uint8_t out[HASH_LEN], const uint8_t key[HASH_LEN], const void *in,
   sodium_memzero (ipad, sizeof (ipad));
   sodium_memzero (opad, sizeof (opad));
   sodium_memzero (inner, sizeof (inner));
+  sodium_memzero (k, sizeof (k));
 }
 
 static void
-mac2 (uint8_t out[HASH_LEN], const uint8_t key[HASH_LEN], const void *a,
-      size_t alen, uint8_t last)
+mac2 (uint8_t out[HASH_LEN], const uint8_t key[HASH_LEN], size_t key_len,
+      const void *a, size_t alen, uint8_t last)
 {
   uint8_t buf[HASH_LEN + 1];
   memcpy (buf, a, alen);
   buf[alen] = last;
-  mac (out, key, buf, alen + 1U);
+  mac (out, key, key_len, buf, alen + 1U);
   sodium_memzero (buf, sizeof (buf));
 }
 
 void
-kdf1 (uint8_t t0[HASH_LEN], const uint8_t key[HASH_LEN], const void *in,
-      size_t len)
+kdf1 (uint8_t t0[HASH_LEN], const uint8_t key[HASH_LEN], size_t key_len,
+      const void *in, size_t len)
 {
   uint8_t prk[HASH_LEN], one = 1;
-  mac (prk, key, in, len);
-  mac (t0, prk, &one, 1);
+  mac (prk, key, key_len, in, len);
+  mac (t0, prk, sizeof (prk), &one, 1);
   sodium_memzero (prk, sizeof (prk));
 }
 
 void
 kdf2 (uint8_t t0[HASH_LEN], uint8_t t1[HASH_LEN], const uint8_t key[HASH_LEN],
-      const void *in, size_t len)
+      size_t key_len, const void *in, size_t len)
 {
   uint8_t prk[HASH_LEN], one = 1;
-  mac (prk, key, in, len);
-  mac (t0, prk, &one, 1);
-  mac2 (t1, prk, t0, HASH_LEN, 2);
+  mac (prk, key, key_len, in, len);
+  mac (t0, prk, sizeof (prk), &one, 1);
+  mac2 (t1, prk, sizeof (prk), t0, HASH_LEN, 2);
   sodium_memzero (prk, sizeof (prk));
 }
 
 void
 kdf3 (uint8_t t0[HASH_LEN], uint8_t t1[HASH_LEN], uint8_t t2[HASH_LEN],
-      const uint8_t key[HASH_LEN], const void *in, size_t len)
+      const uint8_t key[HASH_LEN], size_t key_len, const void *in, size_t len)
 {
   uint8_t prk[HASH_LEN], one = 1;
-  mac (prk, key, in, len);
-  mac (t0, prk, &one, 1);
-  mac2 (t1, prk, t0, HASH_LEN, 2);
-  mac2 (t2, prk, t1, HASH_LEN, 3);
+  mac (prk, key, key_len, in, len);
+  mac (t0, prk, sizeof (prk), &one, 1);
+  mac2 (t1, prk, sizeof (prk), t0, HASH_LEN, 2);
+  mac2 (t2, prk, sizeof (prk), t1, HASH_LEN, 3);
   sodium_memzero (prk, sizeof (prk));
 }
 

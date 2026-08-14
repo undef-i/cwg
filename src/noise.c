@@ -17,7 +17,7 @@ mix_hash (uint8_t h[32], const void *in, size_t len)
 static void
 mix_key (uint8_t ck[32], const void *in, size_t len)
 {
-  kdf1 (ck, ck, in, len);
+  kdf1 (ck, ck, 32, in, len);
 }
 
 static void
@@ -89,12 +89,12 @@ noise_init_make (Noise *n, MsgInit *m, uint32_t idx)
   mix_hash (n->h, epk, 32);
   if (!dh (ss, n->e, n->rpk))
     return false;
-  kdf2 (n->ck, key, n->ck, ss, 32);
+  kdf2 (n->ck, key, n->ck, 32, ss, 32);
   if (!enc (m->stat, n->pk, 32, key, n->h))
     return false;
   if (!dh (ss, n->sk, n->rpk))
     return false;
-  kdf2 (n->ck, key, n->ck, ss, 32);
+  kdf2 (n->ck, key, n->ck, 32, ss, 32);
   tai (ts);
   if (!enc (m->time, ts, sizeof (ts), key, n->h))
     return false;
@@ -118,13 +118,13 @@ noise_init_get (Noise *n, const MsgInit *m)
   mix_hash (h, m->eph, 32);
   if (!dh (ss, n->sk, m->eph))
     return false;
-  kdf2 (ck, key, ck, ss, 32);
+  kdf2 (ck, key, ck, 32, ss, 32);
   if (!dec (pk, m->stat, sizeof (m->stat), key, h)
       || sodium_memcmp (pk, n->rpk, 32))
     return false;
   if (!dh (ss, n->sk, n->rpk))
     return false;
-  kdf2 (ck, key, ck, ss, 32);
+  kdf2 (ck, key, ck, 32, ss, 32);
   if (!dec (ts, m->time, sizeof (m->time), key, h)
       || memcmp (ts, n->last, sizeof (ts)) <= 0)
     return false;
@@ -161,7 +161,7 @@ noise_resp_make (Noise *n, MsgResp *m, uint32_t idx)
   if (!dh (ss, n->e, n->rpk))
     return false;
   mix_key (n->ck, ss, 32);
-  kdf3 (n->ck, tau, key, n->ck, n->psk, 32);
+  kdf3 (n->ck, tau, key, n->ck, 32, n->psk, 32);
   mix_hash (n->h, tau, 32);
   if (!aead_enc (m->empty, &z, NULL, 0, n->h, 32, 0, key) || z != 16)
     return false;
@@ -189,7 +189,7 @@ noise_resp_get (Noise *n, const MsgResp *m)
   if (!dh (ss, n->sk, m->eph))
     return false;
   mix_key (ck, ss, 32);
-  kdf3 (ck, tau, key, ck, n->psk, 32);
+  kdf3 (ck, tau, key, ck, 32, n->psk, 32);
   mix_hash (h, tau, 32);
   if (!aead_dec (empty, &z, m->empty, 16, h, 32, 0, key) || z)
     return false;
@@ -208,7 +208,7 @@ noise_keys (Noise *n, uint8_t tx[32], uint8_t rx[32])
   uint8_t a[32], b[32];
   if (n->state != NS_RESP_MADE && n->state != NS_RESP_GOT)
     return false;
-  kdf2 (a, b, n->ck, NULL, 0);
+  kdf2 (a, b, n->ck, 32, NULL, 0);
   if (n->state == NS_RESP_GOT)
     {
       memcpy (tx, a, 32);
