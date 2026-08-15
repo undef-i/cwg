@@ -32,18 +32,38 @@ typedef struct
   WorkJob slot[SLOT_N];
   unsigned freeq[2][SLOT_PER_TYPE];
   unsigned readyq[SLOT_N];
-  unsigned doneq[SLOT_N];
+  unsigned done_prev[SLOT_N], done_next[SLOT_N];
+  bool done_queued[SLOT_N];
   unsigned free_head[2], free_n[2];
   unsigned ready_head, ready_n;
-  unsigned done_head, done_n;
+  unsigned done_head, done_tail, done_n;
   unsigned active;
   unsigned nthread;
   bool stopping;
   void (*run) (WorkJob *);
-  void (*commit) (WorkJob *);
+  void (*commit) (WorkJob *, unsigned);
 } Pool;
 
 static Pool g;
+
+static void
+done_remove (unsigned idx)
+{
+  unsigned prev = g.done_prev[idx], next = g.done_next[idx];
+  if (!g.done_queued[idx])
+    return;
+  if (prev < SLOT_N)
+    g.done_next[prev] = next;
+  else
+    g.done_head = next;
+  if (next < SLOT_N)
+    g.done_prev[next] = prev;
+  else
+    g.done_tail = prev;
+  g.done_queued[idx] = false;
+  g.done_prev[idx] = g.done_next[idx] = SLOT_N;
+  g.done_n--;
+}
 
 static unsigned
 workers_get (void)
@@ -95,10 +115,17 @@ worker (void *arg)
       pthread_mutex_lock (&g.lock);
       for (unsigned i = 0; i < n; i++)
         {
-          unsigned tail = (g.done_head + g.done_n) % SLOT_N;
+          unsigned slot = idx[i];
           atomic_store_explicit (&g.slot[idx[i]].state, SLOT_DONE,
                                  memory_order_release);
-          g.doneq[tail] = idx[i];
+          g.done_prev[slot] = g.done_tail;
+          g.done_next[slot] = SLOT_N;
+          if (g.done_tail < SLOT_N)
+            g.done_next[g.done_tail] = slot;
+          else
+            g.done_head = slot;
+          g.done_tail = slot;
+          g.done_queued[slot] = true;
           g.done_n++;
         }
       pthread_cond_broadcast (&g.drained);
@@ -109,13 +136,16 @@ worker (void *arg)
 }
 
 int
-work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *))
+work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *, unsigned))
 {
   unsigned made = 0;
   bool lock_ok = false, ready_ok = false, drained_ok = false;
   bool space_ok = false;
   memset (&g, 0, sizeof (g));
   g.event = -1;
+  g.done_head = g.done_tail = SLOT_N;
+  for (unsigned i = 0; i < SLOT_N; i++)
+    g.done_prev[i] = g.done_next[i] = SLOT_N;
   if (pthread_mutex_init (&g.lock, NULL))
     goto fail;
   lock_ok = true;
@@ -252,39 +282,75 @@ work_hnd (void)
     ;
   for (;;)
     {
-      unsigned idx;
-      WorkJob *j;
+      unsigned idx, scan;
+      WorkJob *j, *first = NULL, *last = NULL;
+      Peer *p;
+      unsigned type, n = 0;
       pthread_mutex_lock (&g.lock);
       if (!g.done_n)
         {
           pthread_mutex_unlock (&g.lock);
           break;
         }
-      idx = g.doneq[g.done_head];
-      g.done_head = (g.done_head + 1U) % SLOT_N;
-      g.done_n--;
-      pthread_mutex_unlock (&g.lock);
-
-      j = &g.slot[idx];
-      if (atomic_load_explicit (&j->state, memory_order_acquire) != SLOT_DONE)
-        continue;
-      Peer *p = j->owner;
-      unsigned type = j->type;
-      while ((j = p->work_head[type])
-             && atomic_load_explicit (&j->state, memory_order_acquire)
-                    == SLOT_DONE)
+      idx = SLOT_N;
+      scan = g.done_head;
+      for (unsigned seen = 0; seen < g.done_n && scan < SLOT_N; seen++)
         {
+          j = &g.slot[scan];
+          p = j->owner;
+          type = j->type;
+          WorkJob *head = p->work_head[type];
+          if (head && g.done_queued[(unsigned)(head - g.slot)]
+              && atomic_load_explicit (&head->state, memory_order_acquire)
+                     == SLOT_DONE)
+            {
+              idx = (unsigned)(head - g.slot);
+              break;
+            }
+          scan = g.done_next[scan];
+        }
+      if (idx == SLOT_N)
+        {
+          pthread_mutex_unlock (&g.lock);
+          break;
+        }
+      j = &g.slot[idx];
+      p = j->owner;
+      type = j->type;
+      while (n < BATCH_N && (j = p->work_head[type]))
+        {
+          idx = (unsigned)(j - g.slot);
+          if (!g.done_queued[idx]
+              || atomic_load_explicit (&j->state, memory_order_acquire)
+                     != SLOT_DONE)
+            break;
+          done_remove (idx);
           p->work_head[type] = j->next;
-          if (!p->work_head[type])
-            p->work_tail[type] = NULL;
-          g.commit (j);
+          if (!first)
+            first = j;
+          last = j;
+          n++;
+        }
+      if (!p->work_head[type])
+        p->work_tail[type] = NULL;
+      if (last)
+        last->next = NULL;
+      pthread_mutex_unlock (&g.lock);
+      if (!first)
+        continue;
+
+      g.commit (first, n);
+      for (j = first; j;)
+        {
+          WorkJob *next = j->next;
           atomic_fetch_sub_explicit (&p->work_ref, 1, memory_order_release);
-          work_release (j, type);
           pthread_mutex_lock (&g.lock);
           g.active--;
           if (!g.active)
             pthread_cond_broadcast (&g.drained);
           pthread_mutex_unlock (&g.lock);
+          work_release (j, type);
+          j = next;
         }
     }
   return 0;

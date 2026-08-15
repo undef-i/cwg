@@ -24,6 +24,7 @@ typedef struct HsRate HsRate;
 typedef struct UapiConn UapiConn;
 
 #define STAGE_MAX 128U
+#define GRO_BATCH_SIZE 128U
 
 struct Kp
 {
@@ -125,14 +126,20 @@ struct Dev
   int loop_event;
   int mtu;
   bool tun_vnet;
-  /* GRO state is bounded by the receive batch, not by CPU topology. */
+  bool tun_udp_gso;
   struct
   {
     uint8_t *buf;
     size_t len;
+    size_t cap;
     uint16_t gso_size;
     uint16_t merged;
-  } gro[8];
+    int16_t next;
+    int16_t prev;
+    bool coalesce;
+  } gro[GRO_BATCH_SIZE];
+  int16_t gro_head;
+  int16_t gro_tail;
   uint64_t udp_gen;
   uint64_t udp_seen;
   uint8_t sk[KEY_LEN];

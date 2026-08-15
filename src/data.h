@@ -13,7 +13,7 @@ void data_tick (Dev *d, uint64_t now);
 uint64_t data_next_due (Dev *d, uint64_t now);
 uint64_t data_now (void);
 void data_work (WorkJob *j);
-void data_commit (WorkJob *j);
+void data_commit (WorkJob *j, unsigned n);
 void data_gro_flush (Dev *d);
 bool data_hs_rate_ok (Dev *d, const Ep *ep, uint64_t now);
 void data_hs_rate_prune (Dev *d, uint64_t now);

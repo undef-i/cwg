@@ -47,7 +47,7 @@ dev_add (Dev **head, int ep, const char *name, const char *socket_dir)
   if (!d)
     return -ENOMEM;
   snprintf (d->socket_dir, sizeof (d->socket_dir), "%s", socket_dir);
-  d->tun = tun_open (name, &d->tun_vnet);
+  d->tun = tun_open (name, &d->tun_vnet, &d->tun_udp_gso);
   if (d->tun < 0)
     goto fail;
   if (uapi_open (d) < 0)

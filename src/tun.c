@@ -52,7 +52,12 @@
 #define VIRTIO_NET_HDR_GSO_UDP_L4 5
 #endif
 
-enum { DEFAULT_MTU = 1420, MAX_CONTENT_MTU = PKT_MAX - 32U };
+enum
+{
+  DEFAULT_MTU = 1420,
+  MAX_CONTENT_MTU = PKT_MAX - 32U,
+  TUN_GSO_MAX_SEGMENTS = 128U,
+};
 
 static uint16_t
 csum (const uint8_t *buf, size_t len, uint32_t sum)
@@ -129,7 +134,7 @@ gro_checksum_valid (const uint8_t *pkt, size_t len, size_t ip_len,
 
 static bool
 gro_packet_valid (const uint8_t *pkt, size_t len, bool v6, uint8_t proto,
-                  size_t *ip_len, size_t *transport_len)
+                  size_t *ip_len, size_t *transport_len, bool check_checksum)
 {
   size_t ihl = v6 ? 40U : (size_t)(pkt[0] & 15U) * 4U;
   size_t thl;
@@ -142,7 +147,8 @@ gro_packet_valid (const uint8_t *pkt, size_t len, bool v6, uint8_t proto,
     return false;
   thl = proto == IPPROTO_TCP ? (size_t)(pkt[ihl + 12] >> 4) * 4U : 8U;
   if (thl < (proto == IPPROTO_TCP ? 20U : 8U) || thl > 60U
-      || ihl + thl >= len || !gro_checksum_valid (pkt, len, ihl, v6, proto))
+      || ihl + thl >= len
+      || (check_checksum && !gro_checksum_valid (pkt, len, ihl, v6, proto)))
     return false;
   *ip_len = ihl;
   *transport_len = thl;
@@ -166,26 +172,28 @@ gro_update_checksum (uint8_t *pkt, size_t len, size_t ip_len, bool v6,
 }
 
 static bool
-tun_vnet_setup (int fd, bool *vnet)
+tun_vnet_setup (int fd, bool *vnet, bool *udp_gso)
 {
   unsigned offload = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
   *vnet = false;
+  *udp_gso = false;
   if (ioctl (fd, TUNSETOFFLOAD, offload) < 0)
     return false;
-  (void)ioctl (fd, TUNSETOFFLOAD, offload | TUN_F_USO4 | TUN_F_USO6);
+  *udp_gso = ioctl (fd, TUNSETOFFLOAD, offload | TUN_F_USO4 | TUN_F_USO6) == 0;
   *vnet = true;
   return true;
 }
 
 int
-tun_open (const char *name, bool *vnet)
+tun_open (const char *name, bool *vnet, bool *udp_gso)
 {
   struct ifreq ifr = { 0 };
   int fd = open ("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0)
     return -1;
-  if (!vnet)
+  if (!vnet || !udp_gso)
     {
+      close (fd);
       errno = EINVAL;
       return -1;
     }
@@ -200,20 +208,21 @@ tun_open (const char *name, bool *vnet)
           return -1;
         }
       *vnet = false;
+      *udp_gso = false;
       return fd;
     }
-  if (tun_vnet_setup (fd, vnet))
+  if (tun_vnet_setup (fd, vnet, udp_gso))
     return fd;
   close (fd);
   return -1;
 }
 
 int
-tun_adopt (int fd, const char *name, bool *vnet)
+tun_adopt (int fd, const char *name, bool *vnet, bool *udp_gso)
 {
   struct ifreq ifr = { 0 };
   int flags;
-  if (!vnet)
+  if (!vnet || !udp_gso)
     return -1;
   if (fd < 0 || ioctl (fd, (int)TUNGETIFF, &ifr) < 0
       || strncmp (ifr.ifr_name, name, IFNAMSIZ)
@@ -223,8 +232,10 @@ tun_adopt (int fd, const char *name, bool *vnet)
       || fcntl (fd, F_SETFD, flags | FD_CLOEXEC) < 0)
     return -1;
   *vnet = (ifr.ifr_flags & IFF_VNET_HDR) != 0;
-  if (*vnet && !tun_vnet_setup (fd, vnet))
+  if (*vnet && !tun_vnet_setup (fd, vnet, udp_gso))
     return -1;
+  if (!*vnet)
+    *udp_gso = false;
   return fd;
 }
 
@@ -325,7 +336,12 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
     {
       if (hdr.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)
         {
-          size_t at = (size_t)hdr.csum_start + hdr.csum_offset;
+          size_t csum_start = hdr.csum_start;
+          size_t csum_offset = hdr.csum_offset;
+          size_t at;
+          if (csum_start > pkt_len || csum_offset > pkt_len - csum_start)
+            return -1;
+          at = csum_start + csum_offset;
           if (at + 1U >= pkt_len)
             return -1;
           uint16_t initial = (uint16_t)((uint16_t)pkt[at] << 8 | pkt[at + 1]);
@@ -347,7 +363,11 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
     {
       ip_len = 40;
       addr_len = 16;
+      if (pkt_len < ip_len)
+        return -1;
       proto = pkt[6];
+      if (((size_t)pkt[4] << 8 | pkt[5]) != pkt_len - ip_len)
+        return -1;
     }
   else
     {
@@ -356,17 +376,26 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
       proto = pkt[9];
       if (ip_len < 20 || ip_len > pkt_len)
         return -1;
+      if (((size_t)pkt[2] << 8 | pkt[3]) != pkt_len)
+        return -1;
     }
   tcp = hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV4
         || hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV6;
   if ((tcp && proto != IPPROTO_TCP) || (!tcp && proto != IPPROTO_UDP)
-      || (!tcp && hdr.gso_type != VIRTIO_NET_HDR_GSO_UDP_L4))
+      || (!tcp && hdr.gso_type != VIRTIO_NET_HDR_GSO_UDP_L4)
+      || (v6 && hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV4)
+      || (!v6 && hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV6))
+    return -1;
+  if (hdr.csum_start != ip_len)
     return -1;
   if (ip_len + (tcp ? 20U : 8U) > pkt_len)
     return -1;
   transport_len = tcp ? (size_t)(pkt[ip_len + 12] >> 4) * 4U : 8U;
   hdr_len = ip_len + transport_len;
   if (transport_len < (tcp ? 20U : 8U) || hdr_len > pkt_len || hdr.gso_size > pkt_len - hdr_len)
+    return -1;
+  size_t payload_len = pkt_len - hdr_len;
+  if (1U + (payload_len - 1U) / hdr.gso_size > TUN_GSO_MAX_SEGMENTS)
     return -1;
   data_at = hdr_len;
   gso_size = hdr.gso_size;
@@ -436,7 +465,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
 }
 
 int
-tun_gro_tcp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
+tun_gro_tcp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
              uint16_t *merged_count, const uint8_t *next, size_t next_len)
 {
   size_t ip_len, tcp_len, next_ip_len, next_tcp_len, first_payload,
@@ -447,18 +476,23 @@ tun_gro_tcp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
   uint8_t first_flags, next_flags, final_flags;
   if (!first || !first_len || !gso_size || !merged_count || !next
       || *first_len < 40 || next_len < 40
-      || *first_len > UINT16_MAX || next_len > UINT16_MAX)
+      || *first_len > cap || *first_len > UINT16_MAX || next_len > UINT16_MAX)
     return 0;
   v6 = (first[0] >> 4) == 6;
   if ((next[0] >> 4) != (first[0] >> 4))
     return 0;
   ip_len = v6 ? 40U : (size_t)(first[0] & 15U) * 4U;
   proto = IPPROTO_TCP;
-  if (!gro_packet_valid (first, *first_len, v6, proto, &ip_len, &tcp_len)
+  if (!gro_packet_valid (first, *first_len, v6, proto, &ip_len, &tcp_len,
+                         false)
       || !gro_packet_valid (next, next_len, v6, proto, &next_ip_len,
-                            &next_tcp_len)
+                            &next_tcp_len, false)
       || ip_len != next_ip_len)
     return 0;
+  if (!gro_checksum_valid (first, *first_len, ip_len, v6, IPPROTO_TCP))
+    return -1;
+  if (!gro_checksum_valid (next, next_len, next_ip_len, v6, IPPROTO_TCP))
+    return -2;
   if (tcp_len != next_tcp_len)
     return 0;
   if (memcmp (first + (v6 ? 8 : 12), next + (v6 ? 8 : 12), v6 ? 32 : 8)
@@ -480,6 +514,8 @@ tun_gro_tcp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
     *gso_size = (uint16_t)first_payload;
   if (!first_payload || !next_payload || *first_len + next_payload > PKT_MAX)
     return 0;
+  if (*first_len + next_payload > cap)
+    return -3;
   if (get32 (first + ip_len + 4) + (uint32_t)first_payload
       == get32 (next + ip_len + 4))
     {
@@ -533,7 +569,7 @@ account:
 }
 
 int
-tun_gro_udp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
+tun_gro_udp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
              uint16_t *merged_count, const uint8_t *next, size_t next_len)
 {
   size_t ip_len, udp_len, next_ip_len, next_udp_len, first_payload,
@@ -542,21 +578,25 @@ tun_gro_udp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
 
   if (!first || !first_len || !gso_size || !merged_count || !next
       || *first_len < 28 || next_len < 28
-      || *first_len > UINT16_MAX || next_len > UINT16_MAX)
+      || *first_len > cap || *first_len > UINT16_MAX || next_len > UINT16_MAX)
     return 0;
   v6 = (first[0] >> 4) == 6;
   if ((next[0] >> 4) != (first[0] >> 4))
     return 0;
   ip_len = v6 ? 40U : (size_t)(first[0] & 15U) * 4U;
   if (!gro_packet_valid (first, *first_len, v6, IPPROTO_UDP, &ip_len,
-                         &udp_len)
+                         &udp_len, false)
       || !gro_packet_valid (next, next_len, v6, IPPROTO_UDP, &next_ip_len,
-                            &next_udp_len)
+                            &next_udp_len, false)
       || udp_len != 8U || next_udp_len != 8U || ip_len != next_ip_len
        || memcmp (first + (v6 ? 8 : 12), next + (v6 ? 8 : 12), v6 ? 32 : 8)
        || memcmp (first + ip_len, next + ip_len, 4)
-       || !gro_ip_headers_match (first, next, v6))
+      || !gro_ip_headers_match (first, next, v6))
     return 0;
+  if (!gro_checksum_valid (first, *first_len, ip_len, v6, IPPROTO_UDP))
+    return -1;
+  if (!gro_checksum_valid (next, next_len, next_ip_len, v6, IPPROTO_UDP))
+    return -2;
   first_payload = *first_len - ip_len - 8U;
   next_payload = next_len - ip_len - 8U;
   if (!*gso_size)
@@ -564,6 +604,8 @@ tun_gro_udp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
   if (!first_payload || !next_payload || next_payload > *gso_size
       || first_payload % *gso_size || *first_len + next_payload > PKT_MAX)
     return 0;
+  if (*first_len + next_payload > cap)
+    return -3;
   merged = *first_len + next_payload;
   memcpy (first + *first_len, next + ip_len + 8U, next_payload);
   if (v6)
@@ -590,6 +632,28 @@ tun_gro_udp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
   return *gso_size;
 }
 
+bool
+tun_gro_udp_flow (const uint8_t *first, size_t first_len,
+                  const uint8_t *next, size_t next_len)
+{
+  bool v6;
+  size_t ip_len, next_ip_len;
+  size_t udp_len, next_udp_len;
+  if (!first || !next || first_len < 28U || next_len < 28U)
+    return false;
+  v6 = (first[0] >> 4) == 6;
+  if ((next[0] >> 4) != (first[0] >> 4)
+      || !gro_packet_valid (first, first_len, v6, IPPROTO_UDP, &ip_len,
+                            &udp_len, false)
+      || !gro_packet_valid (next, next_len, v6, IPPROTO_UDP, &next_ip_len,
+                            &next_udp_len, false)
+      || udp_len != 8U || next_udp_len != 8U || ip_len != next_ip_len)
+    return false;
+  return !memcmp (first + (v6 ? 8 : 12), next + (v6 ? 8 : 12),
+                  v6 ? 32 : 8)
+         && !memcmp (first + ip_len, next + ip_len, 4);
+}
+
 ssize_t
 tun_write (int fd, bool vnet, uint8_t *buf, size_t len)
 {
@@ -605,19 +669,39 @@ tun_write_gso (int fd, bool vnet, uint8_t *buf, size_t len,
   struct virtio_net_hdr *v = (void *)hdr;
   if (vnet && gso_size)
     {
-      size_t ip_len = (buf[0] >> 4) == 6 ? 40U : (size_t)(buf[0] & 15U) * 4U;
-      uint8_t proto = buf[(buf[0] >> 4) == 6 ? 6 : 9];
+      bool v6;
+      size_t ip_len;
+      uint8_t proto;
       size_t transport_len;
-      if (ip_len < 20 || ip_len + 20 > len)
+      if (!buf || !len || len > UINT16_MAX)
         {
           errno = EINVAL;
           return -1;
         }
+      v6 = (buf[0] >> 4) == 6;
+      ip_len = v6 ? 40U : (size_t)(buf[0] & 15U) * 4U;
+      if ((v6 && len < 40U) || (!v6 && ((buf[0] >> 4) != 4 || ip_len < 20U))
+          || ip_len > len)
+        {
+          errno = EINVAL;
+          return -1;
+        }
+      proto = buf[v6 ? 6 : 9];
       if (proto == IPPROTO_TCP)
         {
+          if (ip_len + 20U > len)
+            {
+              errno = EINVAL;
+              return -1;
+            }
           transport_len = (size_t)(buf[ip_len + 12] >> 4) * 4U;
-          v->gso_type = (buf[0] >> 4) == 6 ? VIRTIO_NET_HDR_GSO_TCPV6
-                                            : VIRTIO_NET_HDR_GSO_TCPV4;
+          if (transport_len < 20U || transport_len > 60U)
+            {
+              errno = EINVAL;
+              return -1;
+            }
+          v->gso_type = v6 ? VIRTIO_NET_HDR_GSO_TCPV6
+                            : VIRTIO_NET_HDR_GSO_TCPV4;
           v->csum_offset = 16;
         }
       else if (proto == IPPROTO_UDP)
@@ -636,6 +720,11 @@ tun_write_gso (int fd, bool vnet, uint8_t *buf, size_t len,
           errno = EINVAL;
           return -1;
         }
+      if (gso_size > len - ip_len - transport_len)
+        {
+          errno = EINVAL;
+          return -1;
+        }
       v->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
       v->hdr_len = (uint16_t)(ip_len + transport_len);
       v->gso_size = gso_size;
@@ -645,8 +734,8 @@ tun_write_gso (int fd, bool vnet, uint8_t *buf, size_t len,
           errno = EINVAL;
           return -1;
         }
-      size_t addr_len = (buf[0] >> 4) == 6 ? 16U : 4U;
-      size_t addr_at = (buf[0] >> 4) == 6 ? 8U : 12U;
+      size_t addr_len = v6 ? 16U : 4U;
+      size_t addr_at = v6 ? 8U : 12U;
       uint16_t plen = (uint16_t)(len - ip_len);
       uint16_t pseudo = csum (NULL, 0,
                               pseudo_csum (proto, buf + addr_at,

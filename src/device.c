@@ -97,6 +97,10 @@ dev_new (const char *name)
   d->udp6 = -1;
   d->udp_old4 = -1;
   d->udp_old6 = -1;
+  d->gro_head = -1;
+  d->gro_tail = -1;
+  for (size_t i = 0; i < GRO_BATCH_SIZE; i++)
+    d->gro[i].next = d->gro[i].prev = -1;
   d->loop_event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (d->loop_event < 0)
     {

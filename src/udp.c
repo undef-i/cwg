@@ -1,4 +1,5 @@
 #include "udp.h"
+#include "work.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -320,6 +321,76 @@ udp_send (int fd, const Ep *ep, const void *buf, size_t len)
     n = sendmsg (fd, &msg, 0);
   while (n < 0 && errno == EINTR);
   return n;
+}
+
+int
+udp_send_batch (int fd, const Ep *ep, WorkJob *jobs, unsigned n)
+{
+  struct mmsghdr msg[16] = { 0 };
+  struct iovec iov[16];
+  uint8_t control[16][CMSG_SPACE (sizeof (struct in6_pktinfo))] = { 0 };
+  if (!ep || !jobs || !n || n > 16
+      || (ep->sa.ss_family != AF_INET && ep->sa.ss_family != AF_INET6))
+    {
+      errno = EINVAL;
+      return -1;
+    }
+  WorkJob *job = jobs;
+  for (unsigned i = 0; i < n; i++)
+    {
+      if (!job)
+        {
+          errno = EINVAL;
+          return -1;
+        }
+      job = job->next;
+    }
+  for (unsigned i = 0; i < n; i++)
+    {
+      iov[i].iov_base = jobs->buf;
+      iov[i].iov_len = jobs->len;
+      msg[i].msg_hdr.msg_name = (void *)&ep->sa;
+      msg[i].msg_hdr.msg_namelen = ep->len;
+      msg[i].msg_hdr.msg_iov = &iov[i];
+      msg[i].msg_hdr.msg_iovlen = 1;
+      if (ep->src_len)
+        {
+          struct cmsghdr *cmsg;
+          msg[i].msg_hdr.msg_control = control[i];
+          if (ep->src.ss_family == AF_INET)
+            {
+              struct in_pktinfo *info;
+              msg[i].msg_hdr.msg_controllen = CMSG_SPACE (sizeof (*info));
+              cmsg = CMSG_FIRSTHDR (&msg[i].msg_hdr);
+              cmsg->cmsg_level = IPPROTO_IP;
+              cmsg->cmsg_type = IP_PKTINFO;
+              cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+              info = (void *)CMSG_DATA (cmsg);
+              info->ipi_ifindex = (int)ep->ifindex;
+              info->ipi_spec_dst
+                  = ((const struct sockaddr_in *)&ep->src)->sin_addr;
+            }
+          else if (ep->src.ss_family == AF_INET6)
+            {
+              struct in6_pktinfo *info;
+              msg[i].msg_hdr.msg_controllen = CMSG_SPACE (sizeof (*info));
+              cmsg = CMSG_FIRSTHDR (&msg[i].msg_hdr);
+              cmsg->cmsg_level = IPPROTO_IPV6;
+              cmsg->cmsg_type = IPV6_PKTINFO;
+              cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+              info = (void *)CMSG_DATA (cmsg);
+              info->ipi6_ifindex = ep->ifindex;
+              info->ipi6_addr
+                  = ((const struct sockaddr_in6 *)&ep->src)->sin6_addr;
+            }
+        }
+      jobs = jobs->next;
+    }
+  int sent;
+  do
+    sent = sendmmsg (fd, msg, n, 0);
+  while (sent < 0 && errno == EINTR);
+  return sent;
 }
 
 ssize_t

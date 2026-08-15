@@ -38,7 +38,7 @@ struct WorkJob
   uint8_t buf[2048];
 };
 
-int work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *));
+int work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *, unsigned));
 int work_fd (void);
 int work_hnd (void);
 WorkJob *work_reserve (unsigned type);

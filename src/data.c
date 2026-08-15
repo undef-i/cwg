@@ -511,17 +511,25 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
 void
 data_gro_flush (Dev *d)
 {
-  for (size_t i = 0; i < sizeof (d->gro) / sizeof (d->gro[0]); i++)
+  while (d->gro_head >= 0)
     {
-      if (!d->gro[i].len)
-        continue;
-      if (tun_write_gso (d->tun, d->tun_vnet, d->gro[i].buf, d->gro[i].len,
-                         d->gro[i].merged ? d->gro[i].gso_size : 0)
-          != (ssize_t)d->gro[i].len)
+      size_t selected = (size_t)d->gro_head;
+      if (tun_write_gso (d->tun, d->tun_vnet, d->gro[selected].buf,
+                         d->gro[selected].len,
+                         d->gro[selected].merged ? d->gro[selected].gso_size
+                                                  : 0)
+          != (ssize_t)d->gro[selected].len)
         err ("(%s) tun write: %s", d->name, strerror (errno));
-      d->gro[i].len = 0;
-      d->gro[i].gso_size = 0;
-      d->gro[i].merged = 0;
+      d->gro[selected].len = 0;
+      d->gro[selected].gso_size = 0;
+      d->gro[selected].merged = 0;
+      d->gro_head = d->gro[selected].next;
+      if (d->gro_head >= 0)
+        d->gro[d->gro_head].prev = -1;
+      else
+        d->gro_tail = -1;
+      d->gro[selected].next = d->gro[selected].prev = -1;
+      d->gro[selected].coalesce = false;
     }
 }
 
@@ -529,21 +537,27 @@ static bool
 gro_candidate (const uint8_t *buf, size_t len)
 {
   size_t ip_len;
-  if (len < 40 || ((buf[0] >> 4) != 4 && (buf[0] >> 4) != 6))
+  if (len < 28 || ((buf[0] >> 4) != 4 && (buf[0] >> 4) != 6))
     return false;
   ip_len = (buf[0] >> 4) == 6 ? 40U : (size_t)(buf[0] & 15U) * 4U;
   uint8_t proto = buf[(buf[0] >> 4) == 6 ? 6 : 9];
-  return ip_len >= 20
-         && ((proto == IPPROTO_TCP && ip_len + 20 <= len
-              && (buf[ip_len + 12] >> 4) * 4U >= 20)
-             || (proto == IPPROTO_UDP && ip_len + 8 <= len));
+  if (ip_len < 20 || ip_len > len)
+    return false;
+  if (proto == IPPROTO_UDP)
+    return ip_len + 8U <= len;
+  return proto == IPPROTO_TCP && ip_len + 20U <= len
+         && (buf[ip_len + 12] >> 4) * 4U >= 20U;
 }
 
 static void
 gro_write (Dev *d, const uint8_t *buf, size_t len)
 {
   size_t empty = sizeof (d->gro) / sizeof (d->gro[0]);
-  if (!d->tun_vnet || !gro_candidate (buf, len))
+  bool candidate = gro_candidate (buf, len);
+  bool udp = candidate
+             && buf[(buf[0] >> 4) == 6 ? 6 : 9] == IPPROTO_UDP;
+  bool coalesce = candidate && (!udp || d->tun_udp_gso);
+  if (!d->tun_vnet)
     {
       data_gro_flush (d);
       if (tun_write (d->tun, d->tun_vnet, (uint8_t *)buf, len) != (ssize_t)len)
@@ -553,21 +567,54 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
   for (size_t i = 0; i < sizeof (d->gro) / sizeof (d->gro[0]); i++)
     if (!d->gro[i].len)
       empty = i;
-  for (size_t i = sizeof (d->gro) / sizeof (d->gro[0]); i-- > 0;)
+  for (int16_t at = d->gro_tail; coalesce && at >= 0;
+       at = d->gro[at].prev)
     {
+      size_t i = (size_t)at;
       int gso_size;
-      if (!d->gro[i].len)
+      if (udp)
+        {
+          if (!tun_gro_udp_flow (d->gro[i].buf, d->gro[i].len, buf, len))
+            continue;
+          if (!d->gro[i].coalesce)
+            break;
+        }
+      else if (!d->gro[i].coalesce)
         continue;
+    retry:
       gso_size = d->gro[i].buf[(d->gro[i].buf[0] >> 4) == 6 ? 6 : 9]
                          == IPPROTO_TCP
-                     ? tun_gro_tcp (d->gro[i].buf, &d->gro[i].len,
-                                    &d->gro[i].gso_size, &d->gro[i].merged,
-                                    buf, len)
-                     : tun_gro_udp (d->gro[i].buf, &d->gro[i].len,
-                                    &d->gro[i].gso_size, &d->gro[i].merged,
-                                    buf, len);
+                     ? tun_gro_tcp (d->gro[i].buf, d->gro[i].cap,
+                                    &d->gro[i].len,
+                                     &d->gro[i].gso_size, &d->gro[i].merged,
+                                     buf, len)
+                     : tun_gro_udp (d->gro[i].buf, d->gro[i].cap,
+                                    &d->gro[i].len,
+                                     &d->gro[i].gso_size, &d->gro[i].merged,
+                                     buf, len);
       if (gso_size > 0)
         return;
+      if (gso_size == -3)
+        {
+          size_t cap = d->gro[i].len + len;
+          uint8_t *grown = realloc (d->gro[i].buf, cap);
+          if (!grown)
+            break;
+          d->gro[i].buf = grown;
+          d->gro[i].cap = cap;
+          goto retry;
+        }
+      if (gso_size == -1)
+        {
+          d->gro[i].coalesce = false;
+        }
+      else if (gso_size == -2)
+        {
+          coalesce = false;
+          break;
+        }
+      if (udp)
+        break;
     }
   if (empty == sizeof (d->gro) / sizeof (d->gro[0]))
     {
@@ -575,8 +622,17 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
       data_gro_flush (d);
       empty = 0;
     }
-  if (!d->gro[empty].buf)
-    d->gro[empty].buf = malloc (PKT_MAX);
+  if (d->gro[empty].cap < len)
+    {
+      uint8_t *grown = realloc (d->gro[empty].buf, len);
+      if (!grown)
+        {
+          err ("(%s) GRO allocation: %s", d->name, strerror (errno));
+          return;
+        }
+      d->gro[empty].buf = grown;
+      d->gro[empty].cap = len;
+    }
   if (!d->gro[empty].buf)
     {
       err ("(%s) GRO allocation: %s", d->name, strerror (errno));
@@ -586,6 +642,14 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
   d->gro[empty].len = len;
   d->gro[empty].gso_size = 0;
   d->gro[empty].merged = 0;
+  d->gro[empty].prev = d->gro_tail;
+  d->gro[empty].next = -1;
+  if (d->gro_tail >= 0)
+    d->gro[d->gro_tail].next = (int16_t)empty;
+  else
+    d->gro_head = (int16_t)empty;
+  d->gro_tail = (int16_t)empty;
+  d->gro[empty].coalesce = coalesce;
 }
 
 static bool
@@ -763,7 +827,7 @@ data_tun (Dev *d, const uint8_t *buf, size_t len)
     {
       pthread_rwlock_unlock (&d->lock);
       data_work (&j);
-      data_commit (&j);
+      data_commit (&j, 1);
       return;
     }
   pthread_rwlock_unlock (&d->lock);
@@ -1197,7 +1261,7 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
         {
           pthread_rwlock_unlock (&d->lock);
           data_work (&j);
-          data_commit (&j);
+          data_commit (&j, 1);
         }
       else
         {
@@ -1337,8 +1401,27 @@ data_work (WorkJob *j)
   sodium_memzero (j->key, sizeof (j->key));
 }
 
-void
-data_commit (WorkJob *j)
+static void
+data_out_account (Dev *d, Peer *p, WorkJob *j, uint64_t now)
+{
+  atomic_fetch_add_explicit (&p->tx, j->len, memory_order_relaxed);
+  atomic_store_explicit (&p->last_tx, now, memory_order_relaxed);
+  atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
+  if (j->data_sent)
+    if (!atomic_load_explicit (&p->hs_due, memory_order_relaxed))
+      atomic_store_explicit (&p->hs_due,
+                             now + new_handshake_ms (d)
+                                 + randombytes_uniform (RETRY_JITTER_MS),
+                             memory_order_relaxed);
+  if (p->kp.initiator && p->rekey_due && now >= p->rekey_due)
+    atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
+  pka_arm (p, now);
+  if (j->cnt >= rekey_msg_limit)
+    atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
+}
+
+static void
+data_commit_one (WorkJob *j)
 {
   Dev *d = j->dev;
   Peer *p;
@@ -1354,25 +1437,7 @@ data_commit (WorkJob *j)
       pthread_mutex_unlock (&d->data_lock);
       int fd = sock (d, &ep);
       if (fd >= 0 && udp_send (fd, &ep, j->buf, j->len) == (ssize_t)j->len)
-        {
-          atomic_fetch_add_explicit (&p->tx, j->len, memory_order_relaxed);
-          uint64_t now = data_now ();
-          atomic_store_explicit (&p->last_tx, now,
-                                 memory_order_relaxed);
-          atomic_store_explicit (&p->ka_due, 0, memory_order_relaxed);
-          if (j->data_sent)
-            if (!atomic_load_explicit (&p->hs_due, memory_order_relaxed))
-              atomic_store_explicit (
-                  &p->hs_due,
-                  now + new_handshake_ms (d)
-                       + randombytes_uniform (RETRY_JITTER_MS),
-                  memory_order_relaxed);
-          if (p->kp.initiator && p->rekey_due && now >= p->rekey_due)
-            atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
-          pka_arm (p, now);
-          if (j->cnt >= rekey_msg_limit)
-            atomic_store_explicit (&p->hs_due, now, memory_order_relaxed);
-        }
+        data_out_account (d, p, j, data_now ());
       goto out;
     }
 
@@ -1441,4 +1506,62 @@ data_commit (WorkJob *j)
     }
 out:
   pthread_rwlock_unlock (&d->lock);
+}
+
+void
+data_commit (WorkJob *j, unsigned n)
+{
+  if (j && n > 1 && j->type == WORK_OUT)
+    {
+      Dev *d = j->dev;
+      Peer *p;
+      Ep ep;
+      WorkJob *it = j;
+      bool batch_ok = true;
+      for (unsigned i = 0; i < n; i++)
+        {
+          if (!it || !it->ok || it->dev != d
+              || memcmp (it->peer, j->peer, KEY_LEN))
+            {
+              batch_ok = false;
+              break;
+            }
+          it = it->next;
+        }
+      if (batch_ok)
+        {
+          pthread_rwlock_rdlock (&d->lock);
+          p = dev_peer_fnd (d, j->peer);
+          if (p)
+            {
+              pthread_mutex_lock (&d->data_lock);
+              ep = p->addr;
+              pthread_mutex_unlock (&d->data_lock);
+              int fd = sock (d, &ep);
+              int sent = fd >= 0 ? udp_send_batch (fd, &ep, j, n) : -1;
+              it = j;
+              if (sent > 0)
+                {
+                  uint64_t now = data_now ();
+                  for (int i = 0; i < sent; i++, it = it->next)
+                    data_out_account (d, p, it, now);
+                }
+              pthread_rwlock_unlock (&d->lock);
+              for (unsigned i = sent > 0 ? (unsigned)sent : 0; i < n; i++)
+                {
+                  WorkJob *next = it->next;
+                  data_commit_one (it);
+                  it = next;
+                }
+              return;
+            }
+          pthread_rwlock_unlock (&d->lock);
+        }
+    }
+  while (j && n--)
+    {
+      WorkJob *next = j->next;
+      data_commit_one (j);
+      j = next;
+    }
 }
