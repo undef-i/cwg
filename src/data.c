@@ -213,8 +213,8 @@ hs_rate_key (uint8_t key[17], const Ep *ep)
   return false;
 }
 
-static bool
-hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
+bool
+data_hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
 {
   enum { RATE_MS = 1000U / 20U, BURST_MS = RATE_MS * 5U };
   HsRate *rate;
@@ -248,8 +248,8 @@ hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
   return false;
 }
 
-static void
-hs_rate_prune (Dev *d, uint64_t now)
+void
+data_hs_rate_prune (Dev *d, uint64_t now)
 {
   HsRate *rate, *tmp;
   HASH_ITER (hh, d->hs_rate, rate, tmp)
@@ -293,7 +293,7 @@ mac_ok (Dev *d, const Ep *src, const void *msg, size_t mac_off,
                          mac2_off))
     {
       sodium_memzero (cookie, sizeof (cookie));
-      return hs_rate_ok (d, src, now);
+      return data_hs_rate_ok (d, src, now);
     }
   cap = sizeof (MsgCookie) + d->awg.s[AWG_COOKIE];
   out = malloc (cap);
@@ -511,14 +511,18 @@ data_send (Dev *d, Peer *p, const uint8_t *in, size_t len)
 void
 data_gro_flush (Dev *d)
 {
-  if (!d->gro_len)
-    return;
-  if (tun_write_gso (d->tun, d->tun_vnet, d->gro_buf, d->gro_len,
-                     d->gro_size)
-      != (ssize_t)d->gro_len)
-    err ("(%s) tun write: %s", d->name, strerror (errno));
-  d->gro_len = 0;
-  d->gro_size = 0;
+  for (size_t i = 0; i < sizeof (d->gro) / sizeof (d->gro[0]); i++)
+    {
+      if (!d->gro[i].len)
+        continue;
+      if (tun_write_gso (d->tun, d->tun_vnet, d->gro[i].buf, d->gro[i].len,
+                         d->gro[i].merged ? d->gro[i].gso_size : 0)
+          != (ssize_t)d->gro[i].len)
+        err ("(%s) tun write: %s", d->name, strerror (errno));
+      d->gro[i].len = 0;
+      d->gro[i].gso_size = 0;
+      d->gro[i].merged = 0;
+    }
 }
 
 static bool
@@ -538,31 +542,50 @@ gro_candidate (const uint8_t *buf, size_t len)
 static void
 gro_write (Dev *d, const uint8_t *buf, size_t len)
 {
-  size_t old_len;
-  int gso_size;
+  size_t empty = sizeof (d->gro) / sizeof (d->gro[0]);
   if (!d->tun_vnet || !gro_candidate (buf, len))
     {
       data_gro_flush (d);
-      if (tun_write (d->tun, d->tun_vnet, buf, len) != (ssize_t)len)
+      if (tun_write (d->tun, d->tun_vnet, (uint8_t *)buf, len) != (ssize_t)len)
         err ("(%s) tun write: %s", d->name, strerror (errno));
       return;
     }
-  if (d->gro_len)
+  for (size_t i = 0; i < sizeof (d->gro) / sizeof (d->gro[0]); i++)
+    if (!d->gro[i].len)
+      empty = i;
+  for (size_t i = sizeof (d->gro) / sizeof (d->gro[0]); i-- > 0;)
     {
-      old_len = d->gro_len;
-      gso_size = d->gro_buf[(d->gro_buf[0] >> 4) == 6 ? 6 : 9] == IPPROTO_TCP
-                     ? tun_gro_tcp (d->gro_buf, &d->gro_len, buf, len)
-                     : tun_gro_udp (d->gro_buf, &d->gro_len, buf, len);
+      int gso_size;
+      if (!d->gro[i].len)
+        continue;
+      gso_size = d->gro[i].buf[(d->gro[i].buf[0] >> 4) == 6 ? 6 : 9]
+                         == IPPROTO_TCP
+                     ? tun_gro_tcp (d->gro[i].buf, &d->gro[i].len,
+                                    &d->gro[i].gso_size, &d->gro[i].merged,
+                                    buf, len)
+                     : tun_gro_udp (d->gro[i].buf, &d->gro[i].len,
+                                    &d->gro[i].gso_size, &d->gro[i].merged,
+                                    buf, len);
       if (gso_size > 0)
-        {
-          d->gro_size = (uint16_t)gso_size;
-          return;
-        }
-      d->gro_len = old_len;
-      data_gro_flush (d);
+        return;
     }
-  memcpy (d->gro_buf, buf, len);
-  d->gro_len = len;
+  if (empty == sizeof (d->gro) / sizeof (d->gro[0]))
+    {
+      /* The flow table is full. Flush this batch before accepting another flow. */
+      data_gro_flush (d);
+      empty = 0;
+    }
+  if (!d->gro[empty].buf)
+    d->gro[empty].buf = malloc (PKT_MAX);
+  if (!d->gro[empty].buf)
+    {
+      err ("(%s) GRO allocation: %s", d->name, strerror (errno));
+      return;
+    }
+  memcpy (d->gro[empty].buf, buf, len);
+  d->gro[empty].len = len;
+  d->gro[empty].gso_size = 0;
+  d->gro[empty].merged = 0;
 }
 
 static bool
@@ -994,7 +1017,7 @@ void
 data_tick (Dev *d, uint64_t now)
 {
   Peer *p, *tmp;
-  hs_rate_prune (d, now);
+  data_hs_rate_prune (d, now);
   HASH_ITER (hh, d->peer, p, tmp)
   {
     uint64_t reject = awg_hi_ms (&d->awg.reject_after, REJECT_MS);
@@ -1275,7 +1298,7 @@ data_hs_free (Dev *d)
   pthread_cond_signal (&d->hs_ready);
   pthread_mutex_unlock (&d->hs_lock);
   pthread_join (d->hs_thread, NULL);
-  hs_rate_prune (d, UINT64_MAX);
+  data_hs_rate_prune (d, UINT64_MAX);
 }
 
 void

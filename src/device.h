@@ -125,9 +125,14 @@ struct Dev
   int loop_event;
   int mtu;
   bool tun_vnet;
-  uint8_t *gro_buf;
-  size_t gro_len;
-  uint16_t gro_size;
+  /* GRO state is bounded by the receive batch, not by CPU topology. */
+  struct
+  {
+    uint8_t *buf;
+    size_t len;
+    uint16_t gso_size;
+    uint16_t merged;
+  } gro[8];
   uint64_t udp_gen;
   uint64_t udp_seen;
   uint8_t sk[KEY_LEN];
