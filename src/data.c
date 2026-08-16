@@ -536,17 +536,14 @@ data_gro_flush (Dev *d)
 static bool
 gro_candidate (const uint8_t *buf, size_t len)
 {
-  size_t ip_len;
   if (len < 28 || ((buf[0] >> 4) != 4 && (buf[0] >> 4) != 6))
     return false;
-  ip_len = (buf[0] >> 4) == 6 ? 40U : (size_t)(buf[0] & 15U) * 4U;
-  uint8_t proto = buf[(buf[0] >> 4) == 6 ? 6 : 9];
-  if (ip_len < 20 || ip_len > len)
-    return false;
-  if (proto == IPPROTO_UDP)
-    return ip_len + 8U <= len;
-  return proto == IPPROTO_TCP && ip_len + 20U <= len
-         && (buf[ip_len + 12] >> 4) * 4U >= 20U;
+  if ((buf[0] >> 4) == 4)
+    return (buf[0] & 15U) == 5U
+           && ((buf[9] == IPPROTO_TCP && len >= 40U)
+               || (buf[9] == IPPROTO_UDP && len >= 28U));
+  return (buf[6] == IPPROTO_TCP && len >= 60U)
+         || (buf[6] == IPPROTO_UDP && len >= 48U);
 }
 
 static void
@@ -581,29 +578,20 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
         }
       else if (!d->gro[i].coalesce)
         continue;
-    retry:
       gso_size = d->gro[i].buf[(d->gro[i].buf[0] >> 4) == 6 ? 6 : 9]
                          == IPPROTO_TCP
-                     ? tun_gro_tcp (d->gro[i].buf, d->gro[i].cap,
+                     ? tun_gro_tcp (d->gro[i].buf, PKT_MAX,
                                     &d->gro[i].len,
                                      &d->gro[i].gso_size, &d->gro[i].merged,
                                      buf, len)
-                     : tun_gro_udp (d->gro[i].buf, d->gro[i].cap,
+                     : tun_gro_udp (d->gro[i].buf, PKT_MAX,
                                     &d->gro[i].len,
                                      &d->gro[i].gso_size, &d->gro[i].merged,
                                      buf, len);
       if (gso_size > 0)
         return;
       if (gso_size == -3)
-        {
-          size_t cap = d->gro[i].len + len;
-          uint8_t *grown = realloc (d->gro[i].buf, cap);
-          if (!grown)
-            break;
-          d->gro[i].buf = grown;
-          d->gro[i].cap = cap;
-          goto retry;
-        }
+        break;
       if (gso_size == -1)
         {
           d->gro[i].coalesce = false;
@@ -622,17 +610,8 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
       data_gro_flush (d);
       empty = 0;
     }
-  if (d->gro[empty].cap < len)
-    {
-      uint8_t *grown = realloc (d->gro[empty].buf, len);
-      if (!grown)
-        {
-          err ("(%s) GRO allocation: %s", d->name, strerror (errno));
-          return;
-        }
-      d->gro[empty].buf = grown;
-      d->gro[empty].cap = len;
-    }
+  if (!d->gro[empty].buf)
+    d->gro[empty].buf = malloc (PKT_MAX);
   if (!d->gro[empty].buf)
     {
       err ("(%s) GRO allocation: %s", d->name, strerror (errno));

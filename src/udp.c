@@ -326,10 +326,11 @@ udp_send (int fd, const Ep *ep, const void *buf, size_t len)
 int
 udp_send_batch (int fd, const Ep *ep, WorkJob *jobs, unsigned n)
 {
-  struct mmsghdr msg[16] = { 0 };
-  struct iovec iov[16];
-  uint8_t control[16][CMSG_SPACE (sizeof (struct in6_pktinfo))] = { 0 };
-  if (!ep || !jobs || !n || n > 16
+  struct mmsghdr msg[UDP_BATCH_MAX] = { 0 };
+  struct iovec iov[UDP_BATCH_MAX];
+  uint8_t control[UDP_BATCH_MAX][CMSG_SPACE (sizeof (struct in6_pktinfo))]
+      = { 0 };
+  if (!ep || !jobs || !n || n > UDP_BATCH_MAX
       || (ep->sa.ss_family != AF_INET && ep->sa.ss_family != AF_INET6))
     {
       errno = EINVAL;

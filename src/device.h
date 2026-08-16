@@ -131,7 +131,6 @@ struct Dev
   {
     uint8_t *buf;
     size_t len;
-    size_t cap;
     uint16_t gso_size;
     uint16_t merged;
     int16_t next;

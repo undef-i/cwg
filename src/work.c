@@ -14,7 +14,7 @@ enum
 {
   SLOT_N = 2048,
   SLOT_PER_TYPE = SLOT_N / 2,
-  BATCH_N = 16,
+  BATCH_N = UDP_BATCH_MAX,
   SLOT_RESERVED,
   SLOT_READY,
   SLOT_DONE,
@@ -25,8 +25,6 @@ typedef struct
 {
   pthread_mutex_t lock;
   pthread_cond_t ready;
-  pthread_cond_t drained;
-  pthread_cond_t space;
   pthread_t *thread;
   int event;
   WorkJob slot[SLOT_N];
@@ -65,6 +63,22 @@ done_remove (unsigned idx)
   g.done_n--;
 }
 
+static void
+done_push (unsigned idx)
+{
+  if (g.done_queued[idx])
+    return;
+  g.done_prev[idx] = g.done_tail;
+  g.done_next[idx] = SLOT_N;
+  if (g.done_tail < SLOT_N)
+    g.done_next[g.done_tail] = idx;
+  else
+    g.done_head = idx;
+  g.done_tail = idx;
+  g.done_queued[idx] = true;
+  g.done_n++;
+}
+
 static unsigned
 workers_get (void)
 {
@@ -77,11 +91,13 @@ workers_get (void)
     {
       errno = 0;
       v = strtoul (s, &end, 10);
-      if (!errno && !*end && v > 0 && v <= 256U)
+      if (!errno && !*end && v > 0 && v <= SLOT_N)
         return (unsigned)v;
     }
   if (n < 1)
     n = 1;
+  if ((unsigned long)n > SLOT_N)
+    n = SLOT_N;
   return (unsigned)n;
 }
 
@@ -116,19 +132,10 @@ worker (void *arg)
       for (unsigned i = 0; i < n; i++)
         {
           unsigned slot = idx[i];
-          atomic_store_explicit (&g.slot[idx[i]].state, SLOT_DONE,
+          atomic_store_explicit (&g.slot[slot].state, SLOT_DONE,
                                  memory_order_release);
-          g.done_prev[slot] = g.done_tail;
-          g.done_next[slot] = SLOT_N;
-          if (g.done_tail < SLOT_N)
-            g.done_next[g.done_tail] = slot;
-          else
-            g.done_head = slot;
-          g.done_tail = slot;
-          g.done_queued[slot] = true;
-          g.done_n++;
+          done_push (slot);
         }
-      pthread_cond_broadcast (&g.drained);
       pthread_mutex_unlock (&g.lock);
       uint64_t one = 1;
       write (g.event, &one, sizeof (one));
@@ -139,8 +146,7 @@ int
 work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *, unsigned))
 {
   unsigned made = 0;
-  bool lock_ok = false, ready_ok = false, drained_ok = false;
-  bool space_ok = false;
+  bool lock_ok = false, ready_ok = false;
   memset (&g, 0, sizeof (g));
   g.event = -1;
   g.done_head = g.done_tail = SLOT_N;
@@ -152,12 +158,6 @@ work_start (void (*run) (WorkJob *), void (*commit) (WorkJob *, unsigned))
   if (pthread_cond_init (&g.ready, NULL))
     goto fail;
   ready_ok = true;
-  if (pthread_cond_init (&g.drained, NULL))
-    goto fail;
-  drained_ok = true;
-  if (pthread_cond_init (&g.space, NULL))
-    goto fail;
-  space_ok = true;
   g.run = run;
   g.commit = commit;
   g.event = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -193,10 +193,6 @@ fail:
   free (g.thread);
   g.thread = NULL;
   g.nthread = 0;
-  if (space_ok)
-    pthread_cond_destroy (&g.space);
-  if (drained_ok)
-    pthread_cond_destroy (&g.drained);
   if (ready_ok)
     pthread_cond_destroy (&g.ready);
   if (lock_ok)
@@ -241,7 +237,6 @@ work_release (WorkJob *j, unsigned type)
   tail = (g.free_head[type] + g.free_n[type]) % SLOT_PER_TYPE;
   g.freeq[type][tail] = idx;
   g.free_n[type]++;
-  pthread_cond_signal (&g.space);
   pthread_mutex_unlock (&g.lock);
 }
 
@@ -282,7 +277,7 @@ work_hnd (void)
     ;
   for (;;)
     {
-      unsigned idx, scan;
+      unsigned idx;
       WorkJob *j, *first = NULL, *last = NULL;
       Peer *p;
       unsigned type, n = 0;
@@ -292,38 +287,21 @@ work_hnd (void)
           pthread_mutex_unlock (&g.lock);
           break;
         }
-      idx = SLOT_N;
-      scan = g.done_head;
-      for (unsigned seen = 0; seen < g.done_n && scan < SLOT_N; seen++)
-        {
-          j = &g.slot[scan];
-          p = j->owner;
-          type = j->type;
-          WorkJob *head = p->work_head[type];
-          if (head && g.done_queued[(unsigned)(head - g.slot)]
-              && atomic_load_explicit (&head->state, memory_order_acquire)
-                     == SLOT_DONE)
-            {
-              idx = (unsigned)(head - g.slot);
-              break;
-            }
-          scan = g.done_next[scan];
-        }
-      if (idx == SLOT_N)
-        {
-          pthread_mutex_unlock (&g.lock);
-          break;
-        }
+      idx = g.done_head;
+      done_remove (idx);
       j = &g.slot[idx];
       p = j->owner;
       type = j->type;
-      while (n < BATCH_N && (j = p->work_head[type]))
+      if (j != p->work_head[type])
+        {
+          pthread_mutex_unlock (&g.lock);
+          continue;
+        }
+      while (n < BATCH_N && (j = p->work_head[type])
+             && atomic_load_explicit (&j->state, memory_order_acquire)
+                    == SLOT_DONE)
         {
           idx = (unsigned)(j - g.slot);
-          if (!g.done_queued[idx]
-              || atomic_load_explicit (&j->state, memory_order_acquire)
-                     != SLOT_DONE)
-            break;
           done_remove (idx);
           p->work_head[type] = j->next;
           if (!first)
@@ -335,6 +313,10 @@ work_hnd (void)
         p->work_tail[type] = NULL;
       if (last)
         last->next = NULL;
+      if ((j = p->work_head[type])
+          && atomic_load_explicit (&j->state, memory_order_acquire)
+                 == SLOT_DONE)
+        done_push ((unsigned)(j - g.slot));
       pthread_mutex_unlock (&g.lock);
       if (!first)
         continue;
@@ -346,8 +328,6 @@ work_hnd (void)
           atomic_fetch_sub_explicit (&p->work_ref, 1, memory_order_release);
           pthread_mutex_lock (&g.lock);
           g.active--;
-          if (!g.active)
-            pthread_cond_broadcast (&g.drained);
           pthread_mutex_unlock (&g.lock);
           work_release (j, type);
           j = next;
@@ -396,9 +376,7 @@ work_stop (void)
   free (g.thread);
   if (g.event >= 0)
     close (g.event);
-  pthread_cond_destroy (&g.drained);
   pthread_cond_destroy (&g.ready);
-  pthread_cond_destroy (&g.space);
   pthread_mutex_destroy (&g.lock);
   memset (&g, 0, sizeof (g));
 }

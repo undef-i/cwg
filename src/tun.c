@@ -399,7 +399,8 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
     return -1;
   data_at = hdr_len;
   gso_size = hdr.gso_size;
-  for (size_t segment = 0; data_at < pkt_len; segment++)
+  size_t emitted = 0;
+  for (; data_at < pkt_len; emitted++)
     {
       size_t data_len = pkt_len - data_at;
       if (data_len > gso_size)
@@ -420,7 +421,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
           uint16_t id = (uint16_t)(((uint16_t)out[4] << 8) | out[5]);
           out[2] = (uint8_t)(total >> 8);
           out[3] = (uint8_t)total;
-          id = (uint16_t)(id + segment);
+          id = (uint16_t)(id + emitted);
           out[4] = (uint8_t)(id >> 8);
           out[5] = (uint8_t)id;
           out[10] = out[11] = 0;
@@ -433,7 +434,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
           uint32_t seq = ((uint32_t)pkt[ip_len + 4] << 24)
                          | ((uint32_t)pkt[ip_len + 5] << 16)
                          | ((uint32_t)pkt[ip_len + 6] << 8) | pkt[ip_len + 7];
-          seq += (uint32_t)(segment * gso_size);
+          seq += (uint32_t)(emitted * gso_size);
           out[ip_len + 4] = (uint8_t)(seq >> 24);
           out[ip_len + 5] = (uint8_t)(seq >> 16);
           out[ip_len + 6] = (uint8_t)(seq >> 8);
@@ -461,7 +462,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
         return -1;
       data_at += data_len;
     }
-  return 0;
+  return (int)emitted;
 }
 
 int
