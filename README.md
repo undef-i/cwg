@@ -7,18 +7,20 @@ A userspace implementation of AmneziaWG and WireGuard
 ### Prebuilt binary
 
 ```sh
-sudo curl -L https://github.com/undef-i/cwg/releases/latest/download/cwg-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin
-sudo ln -sf cwg /usr/local/bin/wireguard-go
-sudo ln -sf cwg /usr/local/bin/amneziawg-go
+curl -fsSL https://github.com/undef-i/cwg/releases/latest/download/cwg-linux-amd64.tar.gz |
+  tar -xz -C /usr/local/bin
+ln -sf cwg /usr/local/bin/wireguard-go
+ln -sf cwg /usr/local/bin/amneziawg-go
 ```
 
 ### Build from source
 
 ```sh
 git clone --recurse-submodules https://github.com/undef-i/cwg
-cd cwg && make && sudo install -m 0755 build/cwg /usr/local/bin/cwg
-sudo ln -sf cwg /usr/local/bin/wireguard-go
-sudo ln -sf cwg /usr/local/bin/amneziawg-go
+cd cwg && make
+install -m 0755 build/cwg /usr/local/bin/cwg
+ln -sf cwg /usr/local/bin/wireguard-go
+ln -sf cwg /usr/local/bin/amneziawg-go
 ```
 
 ## Usage
