@@ -414,14 +414,14 @@ loop_run (Dev *head, int ctl)
             dev_del (&head, d, ep);
           else
             {
-                if (udp_sync (d, ep, &ev) < 0)
-                  goto fail;
+              if (udp_sync (d, ep, &ev) < 0)
+                goto fail;
               pthread_rwlock_wrlock (&d->lock);
               data_tick (d, now);
               dev_reap (d);
               pthread_rwlock_unlock (&d->lock);
+              data_gro_flush (d);
             }
-          data_gro_flush (d);
           d = next;
         }
     }
