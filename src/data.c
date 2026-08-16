@@ -832,57 +832,91 @@ init_get (Dev *d, const Ep *src, MsgInit *m)
 {
   Peer *p, *tmp;
   uint64_t now = data_now ();
-  if (!mac_ok (d, src, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2),
-               m->sender, now))
+  uint8_t found_pk[KEY_LEN];
+  Noise orig, computed;
+  bool have = false;
+  size_t cap;
+  uint8_t *buf;
+  MsgResp *r;
+  uint32_t li;
+  bool ok;
+
+  pthread_rwlock_wrlock (&d->lock);
+  ok = mac_ok (d, src, m, offsetof (MsgInit, mac1), offsetof (MsgInit, mac2),
+               m->sender, now);
+  pthread_rwlock_unlock (&d->lock);
+  if (!ok)
     return;
   awg_type_normalize (m, AWG_INIT);
+
+  pthread_rwlock_rdlock (&d->lock);
   HASH_ITER (hh, d->peer, p, tmp)
-  {
-    Noise n = p->hs;
-    size_t cap = sizeof (MsgResp) + d->awg.s[AWG_RESP];
-    uint8_t *buf = malloc (cap);
-    MsgResp *r = (void *)buf;
-    uint32_t li;
-    if (!buf || !noise_init_get (&n, m)
-        || (p->last_init_ms && now - p->last_init_ms <= HANDSHAKE_INIT_MS))
-      {
-        free (buf);
+    {
+      Noise n;
+      if (p->last_init_ms && now - p->last_init_ms <= HANDSHAKE_INIT_MS)
         continue;
-      }
-    if (p->hs.li)
-      idx_del (&d->idx, p->hs.li);
-    p->hs = n;
-    p->last_init_ms = now;
-    li = idx_add (&d->idx, p, IDX_HS);
-    if (!li || !noise_resp_make (&p->hs, r, li))
-      {
-        idx_del (&d->idx, li);
-        p->hs.li = 0;
-        sodium_memzero (buf, cap);
-        free (buf);
-        return;
-      }
-    roam (p, src);
-    atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
-    atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
-    atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
-    pka_arm (p, now);
-    awg_type_set (&d->awg, AWG_RESP, r);
-    mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
-    if (!idx_fnd (d->idx, li) || !kp_set (d, p, false))
-      {
-        idx_del (&d->idx, li);
-        sodium_memzero (buf, cap);
-        free (buf);
-        return;
-      }
-    size_t len = sizeof (*r);
-    if (awg_wrap (&d->awg, AWG_RESP, buf, &len, cap) == 0)
-      send_pkt (d, p, buf, len, true);
-    sodium_memzero (buf, cap);
-    free (buf);
+      orig = p->hs;
+      n = orig;
+      if (!noise_init_get (&n, m))
+        continue;
+      memcpy (found_pk, p->pk, sizeof (found_pk));
+      computed = n;
+      have = true;
+      break;
+    }
+  pthread_rwlock_unlock (&d->lock);
+  if (!have)
     return;
-  }
+
+  cap = sizeof (MsgResp) + d->awg.s[AWG_RESP];
+  buf = malloc (cap);
+  if (!buf)
+    return;
+  r = (void *)buf;
+
+  pthread_rwlock_wrlock (&d->lock);
+  HASH_FIND (hh, d->peer, found_pk, KEY_LEN, p);
+  if (!p || memcmp (&p->hs, &orig, sizeof (orig)))
+    {
+      pthread_rwlock_unlock (&d->lock);
+      free (buf);
+      return;
+    }
+  if (p->hs.li)
+    idx_del (&d->idx, p->hs.li);
+  p->hs = computed;
+  p->last_init_ms = now;
+  li = idx_add (&d->idx, p, IDX_HS);
+  if (!li || !noise_resp_make (&p->hs, r, li))
+    {
+      idx_del (&d->idx, li);
+      p->hs.li = 0;
+      sodium_memzero (buf, cap);
+      free (buf);
+      pthread_rwlock_unlock (&d->lock);
+      return;
+    }
+  roam (p, src);
+  atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
+  atomic_store_explicit (&p->last_rx, now, memory_order_relaxed);
+  atomic_store_explicit (&p->hs_due, 0, memory_order_relaxed);
+  pka_arm (p, now);
+  awg_type_set (&d->awg, AWG_RESP, r);
+  mac_add (p, r, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2));
+  if (!idx_fnd (d->idx, li) || !kp_set (d, p, false))
+    {
+      idx_del (&d->idx, li);
+      sodium_memzero (buf, cap);
+      free (buf);
+      pthread_rwlock_unlock (&d->lock);
+      return;
+    }
+  size_t len = sizeof (*r);
+  if (awg_wrap (&d->awg, AWG_RESP, buf, &len, cap) == 0)
+    send_pkt (d, p, buf, len, true);
+  sodium_memzero (buf, cap);
+  free (buf);
+  pthread_rwlock_unlock (&d->lock);
 }
 
 static void
@@ -891,14 +925,15 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   Idx *e;
   Peer *p;
   uint32_t li = le32toh (m->recv);
+  pthread_rwlock_wrlock (&d->lock);
   if (!mac_ok (d, src, m, offsetof (MsgResp, mac1), offsetof (MsgResp, mac2),
                m->sender, data_now ())
       || !(e = idx_fnd (d->idx, li)) || e->type != IDX_HS)
-    return;
+    goto out;
   awg_type_normalize (m, AWG_RESP);
   p = e->ptr;
   if (!noise_resp_get (&p->hs, m) || !kp_set (d, p, true))
-    return;
+    goto out;
   roam (p, src);
   atomic_fetch_add_explicit (&p->rx, sizeof (*m), memory_order_relaxed);
   atomic_store_explicit (&p->last_rx, data_now (), memory_order_relaxed);
@@ -914,6 +949,8 @@ resp_get (Dev *d, const Ep *src, MsgResp *m)
   if (!p->qn)
     data_send (d, p, NULL, 0);
   flush (d, p);
+out:
+  pthread_rwlock_unlock (&d->lock);
 }
 
 static Peer *
@@ -929,16 +966,20 @@ static void
 cookie_get (Dev *d, const MsgCookie *m)
 {
   uint8_t cookie[COOKIE_LEN];
-  Idx *e = idx_fnd (d->idx, le32toh (m->recv));
+  Idx *e;
   Peer *p;
+  pthread_rwlock_wrlock (&d->lock);
+  e = idx_fnd (d->idx, le32toh (m->recv));
   if (!e || !(p = idx_peer (d, e)) || !p->mac1_ok
       || !cookie_reply_decrypt (cookie, m->cookie, p->last_mac1, m->nonce,
                                 p->cookie_key))
-    return;
+    goto out;
   memcpy (p->cookie, cookie, sizeof (p->cookie));
   p->cookie_birth = mono ();
   p->cookie_ok = true;
   p->mac1_ok = false;
+out:
+  pthread_rwlock_unlock (&d->lock);
   sodium_memzero (cookie, sizeof (cookie));
 }
 
@@ -1272,7 +1313,6 @@ data_udp (Dev *d, const Ep *src, uint8_t *buf, size_t len)
 static void
 hs_handle (Dev *d, HsJob *job)
 {
-  pthread_rwlock_wrlock (&d->lock);
   switch (job->type)
     {
     case AWG_INIT:
@@ -1286,7 +1326,6 @@ hs_handle (Dev *d, HsJob *job)
       cookie_get (d, (const void *)job->buf);
       break;
     }
-  pthread_rwlock_unlock (&d->lock);
 }
 
 static void *
