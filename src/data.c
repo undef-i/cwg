@@ -226,10 +226,7 @@ data_hs_rate_ok (Dev *d, const Ep *ep, uint64_t now)
     {
       rate = calloc (1, sizeof (*rate));
       if (!rate)
-        {
-          free (rate);
-          return false;
-        }
+        return false;
       memcpy (rate->key, key, sizeof (key));
       rate->last = now;
       rate->tokens = BURST_MS - RATE_MS;
@@ -580,18 +577,14 @@ gro_write (Dev *d, const uint8_t *buf, size_t len)
         continue;
       gso_size = d->gro[i].buf[(d->gro[i].buf[0] >> 4) == 6 ? 6 : 9]
                          == IPPROTO_TCP
-                     ? tun_gro_tcp (d->gro[i].buf, PKT_MAX,
-                                    &d->gro[i].len,
+                     ? tun_gro_tcp (d->gro[i].buf, &d->gro[i].len,
                                      &d->gro[i].gso_size, &d->gro[i].merged,
                                      buf, len)
-                     : tun_gro_udp (d->gro[i].buf, PKT_MAX,
-                                    &d->gro[i].len,
+                     : tun_gro_udp (d->gro[i].buf, &d->gro[i].len,
                                      &d->gro[i].gso_size, &d->gro[i].merged,
                                      buf, len);
       if (gso_size > 0)
         return;
-      if (gso_size == -3)
-        break;
       if (gso_size == -1)
         {
           d->gro[i].coalesce = false;

@@ -466,7 +466,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
 }
 
 int
-tun_gro_tcp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
+tun_gro_tcp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
              uint16_t *merged_count, const uint8_t *next, size_t next_len)
 {
   size_t ip_len, tcp_len, next_ip_len, next_tcp_len, first_payload,
@@ -477,7 +477,7 @@ tun_gro_tcp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
   uint8_t first_flags, next_flags, final_flags;
   if (!first || !first_len || !gso_size || !merged_count || !next
       || *first_len < 40 || next_len < 40
-      || *first_len > cap || *first_len > UINT16_MAX || next_len > UINT16_MAX)
+      || *first_len > UINT16_MAX || next_len > UINT16_MAX)
     return 0;
   v6 = (first[0] >> 4) == 6;
   if ((next[0] >> 4) != (first[0] >> 4))
@@ -515,8 +515,6 @@ tun_gro_tcp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
     *gso_size = (uint16_t)first_payload;
   if (!first_payload || !next_payload || *first_len + next_payload > PKT_MAX)
     return 0;
-  if (*first_len + next_payload > cap)
-    return -3;
   if (get32 (first + ip_len + 4) + (uint32_t)first_payload
       == get32 (next + ip_len + 4))
     {
@@ -570,7 +568,7 @@ account:
 }
 
 int
-tun_gro_udp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
+tun_gro_udp (uint8_t *first, size_t *first_len, uint16_t *gso_size,
              uint16_t *merged_count, const uint8_t *next, size_t next_len)
 {
   size_t ip_len, udp_len, next_ip_len, next_udp_len, first_payload,
@@ -579,7 +577,7 @@ tun_gro_udp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
 
   if (!first || !first_len || !gso_size || !merged_count || !next
       || *first_len < 28 || next_len < 28
-      || *first_len > cap || *first_len > UINT16_MAX || next_len > UINT16_MAX)
+      || *first_len > UINT16_MAX || next_len > UINT16_MAX)
     return 0;
   v6 = (first[0] >> 4) == 6;
   if ((next[0] >> 4) != (first[0] >> 4))
@@ -605,8 +603,6 @@ tun_gro_udp (uint8_t *first, size_t cap, size_t *first_len, uint16_t *gso_size,
   if (!first_payload || !next_payload || next_payload > *gso_size
       || first_payload % *gso_size || *first_len + next_payload > PKT_MAX)
     return 0;
-  if (*first_len + next_payload > cap)
-    return -3;
   merged = *first_len + next_payload;
   memcpy (first + *first_len, next + ip_len + 8U, next_payload);
   if (v6)
@@ -730,11 +726,6 @@ tun_write_gso (int fd, bool vnet, uint8_t *buf, size_t len,
       v->hdr_len = (uint16_t)(ip_len + transport_len);
       v->gso_size = gso_size;
       v->csum_start = (uint16_t)ip_len;
-      if (v->hdr_len > len)
-        {
-          errno = EINVAL;
-          return -1;
-        }
       size_t addr_len = v6 ? 16U : 4U;
       size_t addr_at = v6 ? 8U : 12U;
       uint16_t plen = (uint16_t)(len - ip_len);

@@ -43,12 +43,11 @@ dev_peer_reset (Dev *d, Peer *p)
 {
   if (p->hs.li)
     idx_del (&d->idx, p->hs.li);
-  if (p->kp.li && p->kp.li != p->hs.li)
+  if (p->kp.li)
     idx_del (&d->idx, p->kp.li);
-  if (p->prev.li && p->prev.li != p->hs.li && p->prev.li != p->kp.li)
+  if (p->prev.li)
     idx_del (&d->idx, p->prev.li);
-  if (p->pending.li && p->pending.li != p->hs.li && p->pending.li != p->kp.li
-      && p->pending.li != p->prev.li)
+  if (p->pending.li)
     idx_del (&d->idx, p->pending.li);
   sodium_memzero (&p->hs, sizeof (p->hs));
   sodium_memzero (&p->kp, sizeof (p->kp));
