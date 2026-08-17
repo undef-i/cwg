@@ -361,23 +361,19 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
     return -1;
   if (v6)
     {
-      ip_len = 40;
+      ip_len = hdr.csum_start;
       addr_len = 16;
-      if (pkt_len < ip_len)
+      if (ip_len < 40U || ip_len > pkt_len)
         return -1;
       proto = pkt[6];
-      if (((size_t)pkt[4] << 8 | pkt[5]) != pkt_len - ip_len)
-        return -1;
     }
   else
     {
-      ip_len = (size_t)(pkt[0] & 15U) * 4U;
+      ip_len = hdr.csum_start;
       addr_len = 4;
+      if (ip_len < 20U || ip_len > pkt_len)
+        return -1;
       proto = pkt[9];
-      if (ip_len < 20 || ip_len > pkt_len)
-        return -1;
-      if (((size_t)pkt[2] << 8 | pkt[3]) != pkt_len)
-        return -1;
     }
   tcp = hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV4
         || hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV6;
@@ -386,21 +382,23 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
       || (v6 && hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV4)
       || (!v6 && hdr.gso_type == VIRTIO_NET_HDR_GSO_TCPV6))
     return -1;
-  if (hdr.csum_start != ip_len)
-    return -1;
   if (ip_len + (tcp ? 20U : 8U) > pkt_len)
     return -1;
   transport_len = tcp ? (size_t)(pkt[ip_len + 12] >> 4) * 4U : 8U;
   hdr_len = ip_len + transport_len;
-  if (transport_len < (tcp ? 20U : 8U) || hdr_len > pkt_len || hdr.gso_size > pkt_len - hdr_len)
+  if (transport_len < (tcp ? 20U : 8U) || hdr_len > pkt_len)
     return -1;
   size_t payload_len = pkt_len - hdr_len;
-  if (1U + (payload_len - 1U) / hdr.gso_size > TUN_GSO_MAX_SEGMENTS)
-    return -1;
+  if (!payload_len)
+    return 0;
+  size_t segments = (payload_len + hdr.gso_size - 1U) / hdr.gso_size;
+  size_t limit = segments > TUN_GSO_MAX_SEGMENTS
+                     ? TUN_GSO_MAX_SEGMENTS - 1U
+                     : segments;
   data_at = hdr_len;
   gso_size = hdr.gso_size;
   size_t emitted = 0;
-  for (; data_at < pkt_len; emitted++)
+  for (; data_at < pkt_len && emitted < limit; emitted++)
     {
       size_t data_len = pkt_len - data_at;
       if (data_len > gso_size)
@@ -462,7 +460,7 @@ tun_gso_split (uint8_t *in, size_t len, uint8_t *out, size_t out_cap,
         return -1;
       data_at += data_len;
     }
-  return (int)emitted;
+  return segments > TUN_GSO_MAX_SEGMENTS ? -1 : (int)emitted;
 }
 
 int
