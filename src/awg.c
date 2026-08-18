@@ -302,6 +302,8 @@ awg_wrap (const Awg *a, unsigned type, uint8_t *buf, size_t *len, size_t cap)
   old = *len;
   if (old + pad > cap)
     return -EMSGSIZE;
+  if (!pad && !a->hp)
+    return 0;
   memmove (buf + pad, buf, old);
   randombytes_buf (buf, pad);
   protect (a, buf + pad, type == AWG_DATA ? 16U : old, buf);
