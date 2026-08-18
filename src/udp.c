@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
+#include <linux/udp.h>
 #include <netinet/ip.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -323,6 +324,106 @@ udp_send (int fd, const Ep *ep, const void *buf, size_t len)
   return n;
 }
 
+static int
+udp_send_segmented (int fd, const Ep *ep, WorkJob *jobs, unsigned n)
+{
+  struct iovec iov[UDP_SEGMENT_MAX_DATAGRAMS];
+  uint8_t control[CMSG_SPACE (sizeof (struct in6_pktinfo))
+                  + CMSG_SPACE (sizeof (uint16_t))] = { 0 };
+  size_t max_payload = ep->sa.ss_family == AF_INET ? UINT16_MAX - 28U
+                                                    : UINT16_MAX - 8U;
+  unsigned sent = 0;
+  WorkJob *job = jobs;
+
+  while (sent < n)
+    {
+      unsigned count = 1;
+      size_t total = job->len;
+      size_t gso_size = job->len;
+      WorkJob *last = job;
+      if (!gso_size || gso_size > max_payload)
+        return sent ? (int)sent : -2;
+      iov[0].iov_base = job->buf;
+      iov[0].iov_len = job->len;
+      while (count < UDP_SEGMENT_MAX_DATAGRAMS && sent + count < n
+             && last->next)
+        {
+          WorkJob *next = last->next;
+          if (!next->len || next->len > gso_size
+              || total > max_payload - next->len)
+            break;
+          iov[count].iov_base = next->buf;
+          iov[count].iov_len = next->len;
+          total += next->len;
+          last = next;
+          count++;
+          if (next->len < gso_size)
+            break;
+        }
+      if (count < 2)
+        return sent ? (int)sent : -2;
+
+      struct msghdr msg = {
+        .msg_name = (void *)&ep->sa,
+        .msg_namelen = ep->len,
+        .msg_iov = iov,
+        .msg_iovlen = count,
+        .msg_control = control,
+      };
+      size_t used = 0;
+      if (ep->src_len && ep->src.ss_family == AF_INET)
+        {
+          struct cmsghdr *cmsg = (void *)(control + used);
+          struct in_pktinfo *info = (void *)CMSG_DATA (cmsg);
+          cmsg->cmsg_level = IPPROTO_IP;
+          cmsg->cmsg_type = IP_PKTINFO;
+          cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+          info->ipi_ifindex = (int)ep->ifindex;
+          info->ipi_spec_dst
+              = ((const struct sockaddr_in *)&ep->src)->sin_addr;
+          used += CMSG_SPACE (sizeof (*info));
+        }
+      else if (ep->src_len && ep->src.ss_family == AF_INET6)
+        {
+          struct cmsghdr *cmsg = (void *)(control + used);
+          struct in6_pktinfo *info = (void *)CMSG_DATA (cmsg);
+          cmsg->cmsg_level = IPPROTO_IPV6;
+          cmsg->cmsg_type = IPV6_PKTINFO;
+          cmsg->cmsg_len = CMSG_LEN (sizeof (*info));
+          info->ipi6_ifindex = ep->ifindex;
+          info->ipi6_addr
+              = ((const struct sockaddr_in6 *)&ep->src)->sin6_addr;
+          used += CMSG_SPACE (sizeof (*info));
+        }
+      struct cmsghdr *cmsg = (void *)(control + used);
+      uint16_t segment = (uint16_t)gso_size;
+      cmsg->cmsg_level = IPPROTO_UDP;
+      cmsg->cmsg_type = UDP_SEGMENT;
+      cmsg->cmsg_len = CMSG_LEN (sizeof (segment));
+      memcpy (CMSG_DATA (cmsg), &segment, sizeof (segment));
+      msg.msg_controllen = used + CMSG_SPACE (sizeof (segment));
+
+      ssize_t written;
+      do
+        written = sendmsg (fd, &msg, 0);
+      while (written < 0 && errno == EINTR);
+      if (written < 0)
+        {
+          if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP)
+            return sent ? (int)sent : -2;
+          return sent ? (int)sent : -1;
+        }
+      if ((size_t)written != total)
+        {
+          errno = EIO;
+          return sent ? (int)sent : -1;
+        }
+      sent += count;
+      job = last->next;
+    }
+  return (int)sent;
+}
+
 int
 udp_send_batch (int fd, const Ep *ep, WorkJob *jobs, unsigned n)
 {
@@ -346,6 +447,9 @@ udp_send_batch (int fd, const Ep *ep, WorkJob *jobs, unsigned n)
         }
       job = job->next;
     }
+  int segmented = udp_send_segmented (fd, ep, jobs, n);
+  if (segmented != -2)
+    return segmented;
   for (unsigned i = 0; i < n; i++)
     {
       iov[i].iov_base = jobs->buf;

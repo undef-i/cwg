@@ -9,6 +9,7 @@ typedef struct Ep Ep;
 typedef struct WorkJob WorkJob;
 
 #define UDP_BATCH_MAX 128U
+#define UDP_SEGMENT_MAX_DATAGRAMS 64U
 #define UDP_PACKET_MAX 65535U
 
 struct Ep
