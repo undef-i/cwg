@@ -255,11 +255,13 @@ work_submit (WorkJob *j)
     j->owner->work_head[j->type] = j;
   j->owner->work_tail[j->type] = j;
   atomic_store_explicit (&j->state, SLOT_READY, memory_order_release);
+  bool was_empty = (g.ready_n == 0);
   tail = (g.ready_head + g.ready_n) % SLOT_N;
   g.readyq[tail] = idx;
   g.ready_n++;
   g.active++;
-  pthread_cond_signal (&g.ready);
+  if (was_empty)
+    pthread_cond_signal (&g.ready);
   pthread_mutex_unlock (&g.lock);
 }
 
@@ -279,7 +281,7 @@ work_hnd (void)
     {
       unsigned idx;
       WorkJob *j, *first = NULL, *last = NULL;
-      Peer *p;
+      Peer *p = NULL;
       unsigned type, n = 0;
       pthread_mutex_lock (&g.lock);
       if (!g.done_n)
@@ -287,16 +289,35 @@ work_hnd (void)
           pthread_mutex_unlock (&g.lock);
           break;
         }
-      idx = g.done_head;
+      unsigned cur = g.done_head;
+      unsigned found = SLOT_N;
+      for (unsigned scanned = 0; scanned < g.done_n; scanned++)
+        {
+          if (cur >= SLOT_N)
+            break;
+          unsigned nxt = g.done_next[cur];
+          j = &g.slot[cur];
+          Peer *owner = j->owner;
+          unsigned t = j->type;
+          if (owner && j == owner->work_head[t]
+              && atomic_load_explicit (&j->state, memory_order_acquire)
+                     == SLOT_DONE)
+            {
+              found = cur;
+              break;
+            }
+          cur = nxt;
+        }
+      if (found >= SLOT_N)
+        {
+          pthread_mutex_unlock (&g.lock);
+          break;
+        }
+      idx = found;
       done_remove (idx);
       j = &g.slot[idx];
       p = j->owner;
       type = j->type;
-      if (j != p->work_head[type])
-        {
-          pthread_mutex_unlock (&g.lock);
-          continue;
-        }
       while (n < BATCH_N && (j = p->work_head[type])
              && atomic_load_explicit (&j->state, memory_order_acquire)
                     == SLOT_DONE)

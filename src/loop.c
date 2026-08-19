@@ -204,11 +204,13 @@ loop_run (Dev *head, int ctl)
   for (Dev *d = head; d; d = d->next)
     if (!socket_alive (d))
       goto fail;
+  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
   ev.data.fd = work_fd ();
   if (epoll_ctl (ep, EPOLL_CTL_ADD, work_fd (), &ev) < 0)
     goto fail;
   for (Dev *d = head; d; d = d->next)
     {
+      ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
       ev.data.fd = d->tun;
       if (epoll_ctl (ep, EPOLL_CTL_ADD, d->tun, &ev) < 0)
         goto fail;

@@ -659,7 +659,7 @@ out_job (Dev *d, Peer *p, const uint8_t *buf, size_t len, WorkJob *j)
   j->data_sent = len != 0;
   j->len = len;
   if (len)
-    memcpy (j->buf, buf, len);
+    memcpy (j->buf + sizeof (MsgData), buf, len);
   pthread_mutex_unlock (&d->data_lock);
   return true;
 }
@@ -1397,7 +1397,6 @@ data_work (WorkJob *j)
       size_t plain = j->len;
       size_t pad = plain + awg_content_pad (&j->awg, plain, j->mtu);
       size_t n;
-      memmove (j->buf + sizeof (m), j->buf, plain);
       awg_type_set (&j->awg, AWG_DATA, &m);
       memcpy (j->buf, &m, sizeof (m));
       memset (j->buf + sizeof (m) + plain, 0, pad - plain);
