@@ -49,4 +49,4 @@ Pass `-f` or `--foreground` to run directly without forking.
 
 ## License
 
-GNU General Public License, version 2.
+GNU General Public License, version 3.

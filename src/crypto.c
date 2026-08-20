@@ -109,37 +109,3 @@ dh (uint8_t out[32], const uint8_t sk[32], const uint8_t pk[32])
   return crypto_scalarmult_curve25519 (out, sk, pk) == 0
          && !sodium_is_zero (out, 32);
 }
-
-static void
-nonce_set (uint8_t out[NONCE_LEN], uint64_t n)
-{
-  memset (out, 0, NONCE_LEN);
-  for (size_t i = 0; i < sizeof (n); i++)
-    out[4 + i] = (uint8_t)(n >> (i * 8U));
-}
-
-bool
-aead_enc (uint8_t *ct, size_t *ct_len, const uint8_t *pt, size_t pt_len,
-          const void *ad, size_t ad_len, uint64_t nonce, const uint8_t key[32])
-{
-  unsigned long long n;
-  uint8_t iv[NONCE_LEN];
-  nonce_set (iv, nonce);
-  int rc = crypto_aead_chacha20poly1305_ietf_encrypt (ct, &n, pt, pt_len, ad,
-                                                      ad_len, NULL, iv, key);
-  *ct_len = (size_t)n;
-  return rc == 0;
-}
-
-bool
-aead_dec (uint8_t *pt, size_t *pt_len, const uint8_t *ct, size_t ct_len,
-          const void *ad, size_t ad_len, uint64_t nonce, const uint8_t key[32])
-{
-  unsigned long long n;
-  uint8_t iv[NONCE_LEN];
-  nonce_set (iv, nonce);
-  int rc = crypto_aead_chacha20poly1305_ietf_decrypt (pt, &n, NULL, ct, ct_len,
-                                                      ad, ad_len, iv, key);
-  *pt_len = rc ? 0 : (size_t)n;
-  return rc == 0;
-}
