@@ -2,7 +2,21 @@
 
 A userspace implementation of AmneziaWG and WireGuard
 
-## Installation
+## Quick Start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/undef-i/cwg/master/quickstart.sh | bash
+```
+
+To run it in a non-interactive terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/undef-i/cwg/master/quickstart.sh |
+  bash -s -- --non-interactive [--install-tools/--skip-tools] \
+  [--prebuilt/--source] [--link/--no-link]
+```
+
+## Install
 
 ### Prebuilt binary
 
