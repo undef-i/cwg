@@ -74,9 +74,10 @@ prompt_yes_no() {
   local prompt=$1 default=$2 answer
   [[ -r /dev/tty ]] || die "interactive mode requires a terminal"
   while :; do
-    IFS= read -r -p "$prompt" answer </dev/tty \
-      || die "failed to read prompt"
-    answer=${answer:-$default}
+    printf '%s' "$prompt" >&2
+    IFS= read -r answer </dev/tty || die "failed to read prompt"
+    answer=$(printf '%s' "${answer:-$default}" | tr -d '[:space:]')
+    [[ -z $answer ]] && answer=$default
     case "${answer,,}" in
       y|yes) return 0 ;;
       n|no) return 1 ;;
