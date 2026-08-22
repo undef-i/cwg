@@ -2,12 +2,34 @@
 
 A userspace implementation of AmneziaWG and WireGuard
 
-## Installation
-
-### Prebuilt binary
+## Quick Start
 
 ```sh
-curl -fsSL https://github.com/undef-i/cwg/releases/latest/download/cwg-linux-amd64.tar.gz |
+curl -fsSL https://raw.githubusercontent.com/undef-i/cwg/master/install.sh | bash
+```
+
+To run it in a non-interactive terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/undef-i/cwg/master/install.sh |
+  bash -s -- --non-interactive [--install-tools/--skip-tools] \
+  [--prebuilt/--source] [--link/--no-link]
+```
+
+To uninstall:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/undef-i/cwg/master/install.sh | bash -s -- --uninstall
+```
+
+## Install
+
+### Use prebuilt binary
+
+```sh
+arch=$(uname -m)
+arch=${arch/x86_64/amd64}
+curl -fsSL "https://github.com/undef-i/cwg/releases/latest/download/cwg-linux-$arch.tar.gz" |
   tar -xz -C /usr/local/bin
 ln -sf cwg /usr/local/bin/wireguard-go
 ln -sf cwg /usr/local/bin/amneziawg-go

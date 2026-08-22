@@ -47,12 +47,14 @@ jobs:
 
       - name: Package
         run: |
-          set -euo pipefail
-          staged="$(mktemp -d)"
-          cp build/cwg "$staged/cwg"
-          cp LICENSE "$staged/LICENSE"
-          mkdir -p dist
-          tar -C "$staged" -czf "dist/cwg-linux-amd64.tar.gz" cwg LICENSE
+           set -euo pipefail
+           arch="$(uname -m)"
+           arch="${arch/x86_64/amd64}"
+           staged="$(mktemp -d)"
+           cp build/cwg "$staged/cwg"
+           cp LICENSE "$staged/LICENSE"
+           mkdir -p dist
+           tar -C "$staged" -czf "dist/cwg-linux-$arch.tar.gz" cwg LICENSE
           rm -rf "$staged"
           ls -l dist/
 
